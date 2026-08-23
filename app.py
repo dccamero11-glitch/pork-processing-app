@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "processing.db"
-HOST, PORT = "127.0.0.1", 8088
+HOST, PORT = "0.0.0.0", int(os.environ.get("PORT", "8088"))
 BRANCHES = {"บางบัวทอง", "หลังสวน", "ตรัง"}
 CATEGORIES = {
     "หมูบด A", "หมูบด B", "หมูบด 5", "หมูบดผสมไก่", "หมูอ้วนหมูบด(หมูบด6)",
