@@ -1,24 +1,39 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import hmac
 import os
+import secrets
 import socket
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime
+from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "processing.db"
-HOST, PORT = "0.0.0.0", int(os.environ.get("PORT", "8088"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8088"))
+APP_ENV = os.environ.get("APP_ENV", "development").lower()
+AUTH_SECRET = os.environ.get("AUTH_SECRET", "local-development-secret-change-before-production")
 BRANCHES = {"บางบัวทอง", "หลังสวน", "ตรัง"}
 CATEGORIES = {
     "หมูบด A", "หมูบด B", "หมูบด 5", "หมูบดผสมไก่", "หมูอ้วนหมูบด(หมูบด6)",
     "ขาหน้าล้วน", "ขาหลังล้วน", "ขาหลังเลาะ", "คากิ", "คาตั้งกลม", "เครื่องในต้ม",
     "หมูรวมต้ม", "ไก่บดA", "ไก่สับ", "ไก่รวมต้ม", "น่องไก่", "สะโพกไก่",
+}
+PRICE_PRODUCTS = {
+    "เนื้อแดง", "สะโพก", "สามชั้น", "ซี่โครง", "ขาหน้า", "ขาหลัง", "สันนอก",
+    "อกไก่", "น่องสะโพก",
 }
 
 
@@ -32,24 +47,136 @@ def ai_is_configured():
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+    if USE_POSTGRES:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("ติดตั้ง psycopg[binary] ก่อนใช้ PostgreSQL") from exc
+        raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    else:
+        raw = sqlite3.connect(DB)
+        raw.row_factory = sqlite3.Row
+        raw.execute("PRAGMA foreign_keys=ON")
+
+    class Connection:
+        def execute(self, sql, params=()):
+            if USE_POSTGRES:
+                sql = sql.replace("?", "%s")
+            return raw.execute(sql, params)
+
+        def executemany(self, sql, params):
+            if USE_POSTGRES:
+                sql = sql.replace("?", "%s")
+            return raw.executemany(sql, params)
+
     try:
-        with conn:
-            yield conn
+        yield Connection()
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
     finally:
-        conn.close()
+        raw.close()
 
 
 def init_db():
     with db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS records(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id_column = "BIGSERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS records(
+            id {id_column},
             tx_date TEXT NOT NULL, branch TEXT NOT NULL, category TEXT NOT NULL,
             product_name TEXT NOT NULL, weight_kg REAL NOT NULL,
             image_data TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
         )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS competitor_prices(
+            id {id_column},
+            price_date TEXT NOT NULL, branch TEXT NOT NULL, product_name TEXT NOT NULL,
+            our_price REAL, competitor_1 REAL, competitor_2 REAL, competitor_3 REAL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(price_date, branch, product_name)
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS users(
+            id {id_column}, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+            role TEXT NOT NULL, branch TEXT, active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )""")
+    seed_users()
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    rounds = 210_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, rounds)
+    return f"pbkdf2_sha256${rounds}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+
+
+def verify_password(password, encoded):
+    try:
+        _name, rounds, salt, expected = encoded.split("$", 3)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.urlsafe_b64decode(salt), int(rounds))
+        return hmac.compare_digest(base64.urlsafe_b64encode(actual).decode(), expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def seed_users():
+    accounts = [
+        ("admin", "ADMIN_PASSWORD", "admin123", "admin", None),
+        ("manager_bangbuathong", "MANAGER_BANGBUATHONG_PASSWORD", "manager123", "manager", "บางบัวทอง"),
+        ("manager_trang", "MANAGER_TRANG_PASSWORD", "manager123", "manager", "ตรัง"),
+        ("manager_langsuan", "MANAGER_LANGSUAN_PASSWORD", "manager123", "manager", "หลังสวน"),
+    ]
+    with db() as conn:
+        for username, env_name, default_password, role, branch in accounts:
+            password = os.environ.get(env_name, default_password)
+            exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO users(username,password_hash,role,branch,active,created_at) VALUES(?,?,?,?,?,?)",
+                    (username, hash_password(password), role, branch, 1, datetime.now().isoformat(timespec="seconds")),
+                )
+            elif os.environ.get(env_name):
+                conn.execute("UPDATE users SET password_hash=?,role=?,branch=?,active=1 WHERE username=?",
+                             (hash_password(password), role, branch, username))
+
+
+def create_session(user):
+    payload = {"username": user["username"], "role": user["role"], "branch": user["branch"], "exp": int(time.time()) + 12 * 3600}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode().rstrip("=")
+    signature = hmac.new(AUTH_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def parse_session(token):
+    try:
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(AUTH_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected): return None
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        return payload if payload.get("exp", 0) > time.time() else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def effective_branch(user, requested, allow_all=False):
+    if user["role"] == "admin":
+        if requested == "ALL" and allow_all: return requested
+        if requested in BRANCHES: return requested
+    elif requested in (user["branch"], "ALL"):
+        return user["branch"]
+    raise PermissionError("ไม่มีสิทธิ์เข้าถึงสาขานี้")
+
+
+def validate_production_config():
+    if APP_ENV != "production": return
+    required = ["DATABASE_URL", "AUTH_SECRET", "OPENAI_API_KEY", "ADMIN_PASSWORD",
+                "MANAGER_BANGBUATHONG_PASSWORD", "MANAGER_TRANG_PASSWORD", "MANAGER_LANGSUAN_PASSWORD"]
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    if missing:
+        raise RuntimeError("Production configuration missing: " + ", ".join(missing))
+    if len(AUTH_SECRET) < 32:
+        raise RuntimeError("AUTH_SECRET must contain at least 32 characters in Production")
 
 
 def output_text(response):
@@ -207,7 +334,94 @@ class Handler(SimpleHTTPRequestHandler):
             raise ValueError("ข้อมูลมีขนาดใหญ่เกินไป")
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def current_user(self):
+        if os.environ.get("APP_TESTING") == "1":
+            return {"username": "test-admin", "role": "admin", "branch": None}
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        session = cookie.get("processing_session")
+        return parse_session(session.value) if session else None
+
+    def require_user(self):
+        user = self.current_user()
+        if not user:
+            self.send_json({"message": "กรุณาเข้าสู่ระบบ"}, 401)
+        return user
+
+    def redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
     def do_GET(self):
+        from urllib.parse import urlparse
+        clean_path = urlparse(self.path).path
+        if clean_path == "/api/status":
+            self.send_json({"ai": ai_is_configured(), "date": date.today().isoformat(), "database": "PostgreSQL" if USE_POSTGRES else "SQLite"}); return
+        if clean_path in ("/login.html", "/styles.css", "/overview.css", "/login.js") or clean_path.endswith((".css", ".js")):
+            super().do_GET(); return
+        user = self.current_user()
+        if not user:
+            if clean_path.startswith("/api/"):
+                self.send_json({"message": "กรุณาเข้าสู่ระบบ"}, 401)
+            else:
+                self.redirect("/login.html")
+            return
+        if clean_path == "/api/me":
+            self.send_json({"username": user["username"], "role": user["role"], "branch": user.get("branch")}); return
+        if self.path.startswith("/api/price-history"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            branch = q.get("branch", [""])[0]
+            product = q.get("product", [""])[0]
+            try: branch = effective_branch(user, branch)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+            if product not in PRICE_PRODUCTS:
+                self.send_json({"message": "สาขาหรือสินค้าไม่ถูกต้อง"}, 400); return
+            with db() as conn:
+                rows = [dict(row) for row in conn.execute(
+                    """SELECT price_date,our_price,competitor_1,competitor_2,competitor_3
+                    FROM competitor_prices WHERE branch=? AND product_name=?
+                    ORDER BY price_date DESC LIMIT 90""",
+                    (branch, product),
+                )]
+            self.send_json(rows); return
+        if self.path.startswith("/api/price-summary"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            price_date = q.get("date", [""])[0]
+            branch = q.get("branch", ["ALL"])[0]
+            try:
+                datetime.strptime(price_date, "%Y-%m-%d")
+            except ValueError:
+                self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
+            try: branch = effective_branch(user, branch, allow_all=True)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+            sql = """SELECT branch,product_name,our_price,competitor_1,competitor_2,competitor_3
+                FROM competitor_prices WHERE price_date=?"""
+            params = [price_date]
+            if branch != "ALL":
+                sql += " AND branch=?"; params.append(branch)
+            sql += " ORDER BY branch,product_name"
+            with db() as conn:
+                rows = [dict(row) for row in conn.execute(sql, params)]
+            self.send_json(rows); return
+        if self.path.startswith("/api/competitor-prices"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            price_date = q.get("date", [""])[0]
+            branch = q.get("branch", [""])[0]
+            try:
+                datetime.strptime(price_date, "%Y-%m-%d")
+            except ValueError:
+                self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
+            try: branch = effective_branch(user, branch)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+            with db() as conn:
+                rows = [dict(row) for row in conn.execute(
+                    "SELECT product_name,our_price,competitor_1,competitor_2,competitor_3 FROM competitor_prices WHERE price_date=? AND branch=?",
+                    (price_date, branch),
+                )]
+            self.send_json(rows); return
         if self.path.startswith("/api/report"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -216,6 +430,8 @@ class Handler(SimpleHTTPRequestHandler):
             date_to = q.get("date_to", q.get("date", [date.today().isoformat()]))[0]
             branch = q.get("branch", ["ALL"])[0]
             category = q.get("category", ["ALL"])[0]
+            try: branch = effective_branch(user, branch, allow_all=True)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
             if not show_all:
                 try:
                     datetime.strptime(date_from, "%Y-%m-%d")
@@ -233,14 +449,33 @@ class Handler(SimpleHTTPRequestHandler):
             sql += " GROUP BY tx_date,branch,category,product_name ORDER BY tx_date DESC,branch,category,product_name"
             with db() as conn: rows = [dict(x) for x in conn.execute(sql, params)]
             self.send_json(rows); return
-        if self.path == "/api/status":
-            self.send_json({"ai": ai_is_configured(), "date": date.today().isoformat()}); return
         if self.path == "/": self.path = "/index.html"
         super().do_GET()
 
     def do_POST(self):
         try:
             data = self.body()
+            if self.path == "/api/login":
+                username = str(data.get("username", "")).strip()
+                password = str(data.get("password", ""))
+                with db() as conn:
+                    user_row = conn.execute("SELECT username,password_hash,role,branch,active FROM users WHERE username=?", (username,)).fetchone()
+                if not user_row or not user_row["active"] or not verify_password(password, user_row["password_hash"]):
+                    self.send_json({"message": "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"}, 401); return
+                token = create_session(user_row)
+                self.send_response(200)
+                self.send_header("Set-Cookie", f"processing_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200" + ("; Secure" if APP_ENV == "production" else ""))
+                body = json.dumps({"ok": True}, ensure_ascii=False).encode()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body); return
+            if self.path == "/api/logout":
+                self.send_response(200)
+                self.send_header("Set-Cookie", "processing_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+                self.send_header("Content-Length", "2")
+                self.end_headers(); self.wfile.write(b"{}"); return
+            user = self.require_user()
+            if not user: return
             if self.path == "/api/read-label":
                 image = str(data.get("image", ""))
                 if not image.startswith("data:image/"):
@@ -251,11 +486,52 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_json({"ok": False, "error_code": exc.code, "message": exc.message}, exc.http_status)
                 return
             if self.path == "/api/records":
+                data["branch"] = effective_branch(user, data.get("branch"))
                 valid = prepare_record_rows(data)
                 with db() as conn:
                     conn.executemany("INSERT INTO records(tx_date,branch,category,product_name,weight_kg,image_data,created_at) VALUES(?,?,?,?,?,?,?)", valid)
                 self.send_json({"ok": True, "saved": len(valid)}); return
+            if self.path == "/api/competitor-prices":
+                price_date = data.get("date")
+                branch = effective_branch(user, data.get("branch"))
+                try:
+                    datetime.strptime(price_date, "%Y-%m-%d")
+                except (TypeError, ValueError):
+                    raise ValueError("รูปแบบวันที่ไม่ถูกต้อง")
+                if branch not in BRANCHES:
+                    raise ValueError("สาขาไม่ถูกต้อง")
+
+                saved_rows = []
+                now = datetime.now().isoformat(timespec="seconds")
+                for item in data.get("items", []):
+                    product_name = str(item.get("product_name", "")).strip()
+                    if product_name not in PRICE_PRODUCTS:
+                        raise ValueError("พบชื่อสินค้าที่ไม่ถูกต้อง")
+                    prices = []
+                    for field in ("our_price", "competitor_1", "competitor_2", "competitor_3"):
+                        value = item.get(field)
+                        if value in (None, ""):
+                            prices.append(None)
+                        else:
+                            number = float(value)
+                            if number < 0:
+                                raise ValueError("ราคาต้องไม่ติดลบ")
+                            prices.append(number)
+                    saved_rows.append((price_date, branch, product_name, *prices, now))
+
+                if not saved_rows:
+                    raise ValueError("ไม่มีรายการราคาสำหรับบันทึก")
+                with db() as conn:
+                    conn.executemany("""INSERT INTO competitor_prices(
+                        price_date,branch,product_name,our_price,competitor_1,competitor_2,competitor_3,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(price_date,branch,product_name) DO UPDATE SET
+                        our_price=excluded.our_price, competitor_1=excluded.competitor_1,
+                        competitor_2=excluded.competitor_2, competitor_3=excluded.competitor_3,
+                        updated_at=excluded.updated_at""", saved_rows)
+                self.send_json({"ok": True, "saved": len(saved_rows)}); return
             self.send_json({"message": "ไม่พบ API"}, 404)
+        except PermissionError as exc:
+            self.send_json({"message": str(exc)}, 403)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self.send_json({"message": str(exc)}, 400)
 
@@ -272,6 +548,7 @@ class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
+    validate_production_config()
     init_db()
     server = ExclusiveThreadingHTTPServer((HOST, PORT), Handler)
     print(f"ระบบแปรรูปสินค้าพร้อมใช้งาน: http://localhost:{PORT}")

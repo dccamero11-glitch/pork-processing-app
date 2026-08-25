@@ -27,6 +27,12 @@ class FakeHTTPResponse(io.BytesIO):
 
 
 class LabelReadingTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["APP_TESTING"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("APP_TESTING", None)
+
     def test_clear_label_is_accepted(self):
         result = app.parse_label_response(response_payload())
         self.assertTrue(result["ok"])
@@ -214,6 +220,89 @@ class LabelReadingTests(unittest.TestCase):
                 self.assertEqual(summary[0]["category"], "หมูบด A")
                 self.assertEqual(summary[0]["product_name"], "หมูสามชั้นบาง")
                 self.assertAlmostEqual(summary[0]["weight_kg"], 2.39)
+
+    def test_competitor_prices_save_and_load_by_branch_and_date(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "prices.db"):
+                app.init_db()
+                server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                    payload = {
+                        "date": "2026-08-25",
+                        "branch": "บางบัวทอง",
+                        "items": [{
+                            "product_name": "เนื้อแดง",
+                            "our_price": 150,
+                            "competitor_1": 145,
+                            "competitor_2": 148,
+                            "competitor_3": 147,
+                        }],
+                    }
+                    request = urllib.request.Request(
+                        base_url + "/api/competitor-prices",
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        saved = json.load(response)
+                    query = urllib.parse.urlencode({"date": payload["date"], "branch": payload["branch"]})
+                    with urllib.request.urlopen(base_url + "/api/competitor-prices?" + query, timeout=3) as response:
+                        loaded = json.load(response)
+                    with urllib.request.urlopen(base_url + "/api/price-summary?" + query, timeout=3) as response:
+                        summary = json.load(response)
+                    history_query = urllib.parse.urlencode({"branch": payload["branch"], "product": "เนื้อแดง"})
+                    with urllib.request.urlopen(base_url + "/api/price-history?" + history_query, timeout=3) as response:
+                        history = json.load(response)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+                self.assertEqual(saved["saved"], 1)
+                self.assertEqual(len(loaded), 1)
+                self.assertEqual(loaded[0]["product_name"], "เนื้อแดง")
+                self.assertEqual(loaded[0]["our_price"], 150)
+                self.assertEqual(min(loaded[0]["competitor_1"], loaded[0]["competitor_2"], loaded[0]["competitor_3"]), 145)
+                self.assertEqual(summary[0]["branch"], "บางบัวทอง")
+                self.assertEqual(summary[0]["product_name"], "เนื้อแดง")
+                self.assertEqual(history[0]["price_date"], "2026-08-25")
+
+    def test_login_and_manager_branch_permission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "auth.db"):
+                app.init_db()
+                server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                os.environ.pop("APP_TESTING", None)
+                try:
+                    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                    login = urllib.request.Request(
+                        base_url + "/api/login",
+                        data=json.dumps({"username": "manager_trang", "password": "manager123"}).encode(),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(login, timeout=3) as response:
+                        cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                    me = urllib.request.Request(base_url + "/api/me", headers={"Cookie": cookie})
+                    with urllib.request.urlopen(me, timeout=3) as response:
+                        profile = json.load(response)
+                    forbidden_query = urllib.parse.urlencode({"date": "2026-08-25", "branch": "บางบัวทอง"})
+                    forbidden = urllib.request.Request(
+                        base_url + "/api/competitor-prices?" + forbidden_query,
+                        headers={"Cookie": cookie},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(forbidden, timeout=3)
+                finally:
+                    os.environ["APP_TESTING"] = "1"
+                    server.shutdown(); server.server_close(); thread.join(timeout=2)
+                self.assertEqual(profile["role"], "manager")
+                self.assertEqual(profile["branch"], "ตรัง")
+                self.assertEqual(raised.exception.code, 403)
 
 
 if __name__ == "__main__":
