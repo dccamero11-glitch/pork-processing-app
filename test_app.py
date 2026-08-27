@@ -570,6 +570,30 @@ class LabelReadingTests(unittest.TestCase):
             with original_db() as conn: count=conn.execute("SELECT COUNT(*) count FROM orders").fetchone()["count"]
             self.assertEqual(raised.exception.code,500);self.assertFalse(error["success"]);self.assertNotIn("forced database failure",json.dumps(error));self.assertEqual(count,0)
 
+    def test_existing_order_schema_gets_safe_idempotency_migration(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"existing.db"):
+            raw=app.sqlite3.connect(app.DB)
+            raw.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY AUTOINCREMENT,order_date DATE NOT NULL,branch TEXT NOT NULL,ordered_by TEXT NOT NULL,total_weight NUMERIC NOT NULL,note TEXT NOT NULL DEFAULT '',created_at TIMESTAMP NOT NULL)")
+            raw.execute("CREATE TABLE order_items(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL REFERENCES orders(id),product_name TEXT NOT NULL,quantity NUMERIC NOT NULL,unit TEXT NOT NULL,created_at TIMESTAMP NOT NULL)")
+            raw.commit();raw.close()
+            app.init_db();app.init_db()
+            with app.db() as conn:
+                columns={row["name"] for row in conn.execute("PRAGMA table_info(order_requests)")}
+                indexes={row["name"] for row in conn.execute("PRAGMA index_list(order_requests)")}
+            self.assertEqual(columns,{"request_id","order_id","created_at"})
+            self.assertIn("idx_order_requests_request_id",indexes);self.assertIn("idx_order_requests_order_id",indexes)
+
+    def test_postgres_order_sql_uses_psycopg_placeholders(self):
+        statements=(
+            "SELECT order_id FROM order_requests WHERE request_id=?",
+            "INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+            "INSERT INTO order_items(order_id,product_name,quantity,unit,created_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO order_requests(request_id,order_id,created_at) VALUES(?,?,?)",
+        )
+        for statement in statements:
+            translated=app.postgres_sql(statement)
+            self.assertNotIn("?",translated);self.assertEqual(translated.count("%s"),statement.count("?"))
+
 
 if __name__ == "__main__":
     unittest.main()

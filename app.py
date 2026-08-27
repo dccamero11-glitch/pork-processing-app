@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import io
+import logging
 import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -29,6 +30,8 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "10000"))
 APP_ENV = os.environ.get("APP_ENV", "development").lower()
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "local-development-secret-change-before-production")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("pork-processing-app")
 BRANCH_ORDER = ("บางบัวทอง", "หลังสวน", "ตรัง")
 BRANCHES = set(BRANCH_ORDER)
 CATEGORIES = {
@@ -90,12 +93,12 @@ def db():
     class Connection:
         def execute(self, sql, params=()):
             if USE_POSTGRES:
-                sql = sql.replace("?", "%s")
+                sql = postgres_sql(sql)
             return raw.execute(sql, params)
 
         def executemany(self, sql, params):
             if USE_POSTGRES:
-                sql = sql.replace("?", "%s")
+                sql = postgres_sql(sql)
             return raw.executemany(sql, params)
 
     try:
@@ -106,6 +109,11 @@ def db():
         raise
     finally:
         raw.close()
+
+
+def postgres_sql(sql):
+    """Translate the project's DB-API placeholders for psycopg/PostgreSQL."""
+    return sql.replace("?", "%s")
 
 
 def init_db():
@@ -144,6 +152,9 @@ def init_db():
             request_id TEXT PRIMARY KEY, order_id {order_id_column} NOT NULL REFERENCES orders(id),
             created_at TIMESTAMP NOT NULL
         )""")
+        # Safe, repeatable migration for databases created before idempotent order saves.
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_order_requests_request_id ON order_requests(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_order_requests_order_id ON order_requests(order_id)")
         conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_prices(
             id {id_column}, product_category TEXT NOT NULL, product_name TEXT NOT NULL,
             purchase_cost NUMERIC(12,2) NOT NULL DEFAULT 0, transport_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -687,6 +698,7 @@ class Handler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        order_stage = "not_order_request"
         try:
             data = self.body()
             if self.path == "/api/login":
@@ -732,6 +744,7 @@ class Handler(SimpleHTTPRequestHandler):
                     conn.executemany("INSERT INTO records(tx_date,branch,category,product_name,weight_kg,image_data,created_at) VALUES(?,?,?,?,?,?,?)", valid)
                 self.send_json({"ok": True, "saved": len(valid)}); return
             if self.path == "/api/orders":
+                order_stage = "validate_payload"
                 branch = effective_branch(user, data.get("branch"))
                 order_items = prepare_order_items(data)
                 request_id = str(data.get("request_id", "")).strip()
@@ -743,7 +756,9 @@ class Handler(SimpleHTTPRequestHandler):
                 total_weight = sum((item[1] for item in order_items), Decimal("0"))
                 now = datetime.now().isoformat(timespec="seconds")
                 stored_total = total_weight if USE_POSTGRES else float(total_weight)
+                order_stage = "open_transaction"
                 with db() as conn:
+                    order_stage = "check_idempotency"
                     previous = conn.execute("SELECT order_id FROM order_requests WHERE request_id=?", (request_id,)).fetchone()
                     if previous:
                         order_id = previous["order_id"]
@@ -751,20 +766,25 @@ class Handler(SimpleHTTPRequestHandler):
                         response_total = float(existing["total_weight"])
                         duplicate = True
                     else:
+                        order_stage = "create_order"
                         order_id = conn.execute(
                             """INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at)
                             VALUES(?,?,?,?,?,?) RETURNING id""",
                             (date.today().isoformat(), branch, user["username"], stored_total, note, now),
                         ).fetchone()["id"]
+                        order_stage = "insert_items"
                         conn.executemany(
                             """INSERT INTO order_items(order_id,product_name,quantity,unit,created_at)
                             VALUES(?,?,?,?,?)""",
                             [(order_id, product_name, quantity if USE_POSTGRES else float(quantity), unit, now)
                              for product_name, quantity, unit in order_items],
                         )
+                        order_stage = "save_idempotency"
                         conn.execute("INSERT INTO order_requests(request_id,order_id,created_at) VALUES(?,?,?)", (request_id, order_id, now))
                         response_total = float(total_weight)
                         duplicate = False
+                    order_stage = "commit"
+                order_stage = "send_success"
                 self.send_json({"success": True, "message": "บันทึกคำสั่งซื้อสำเร็จ", "order_id": order_id,
                                 "id": order_id, "saved": len(order_items), "total_weight": response_total,
                                 "duplicate": duplicate}, 200 if duplicate else 201); return
@@ -831,6 +851,7 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self.send_json({"success": False, "error": str(exc), "message": str(exc)}, 400)
         except Exception:
+            logger.exception("POST /api/orders failed stage=%s", order_stage)
             self.send_json({"success": False, "error": "บันทึกข้อมูลไม่สำเร็จ", "message": "บันทึกคำสั่งซื้อไม่สำเร็จ กรุณาลองใหม่"}, 500)
 
 
