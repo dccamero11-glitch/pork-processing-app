@@ -432,5 +432,17 @@ class LabelReadingTests(unittest.TestCase):
         self.assertEqual(sum(row[1] for row in rows), 10)
 
 
+    def test_full_chicken_selling_products_are_unique_and_calculable(self):
+        chicken = app.SELLING_PRODUCTS["ไก่"]
+        required = ("ไก่เนื้อล้วง(ตัว)","ไก่กลม(ตัว)","น่อง+สะโพกไก่","เศษไก่ BL","เศษหนังBL","เศษไก่ BLK","ขายำ(เล็บมือนาง)","กระดูกอ่อนไก่","เครื่องในผ่ารวม","ตับติดใจ","ไก่สับ")
+        self.assertEqual(len(chicken), 24)
+        self.assertEqual(len(chicken), len(set(chicken)))
+        for product in required:
+            values = app.calculate_selling_price({"product_category":"ไก่","product_name":product,"purchase_cost":100,"transport_cost":5,"profit_percent":15})
+            self.assertEqual(float(values[7]), 120.75)
+            self.assertEqual(float(values[8]), 121)
+        self.assertTrue(set(app.SELLING_PRODUCTS["หมู"]).isdisjoint({"ไก่เนื้อล้วง(ตัว)","ไก่กลม(ตัว)"}))
+
+
 if __name__ == "__main__":
     unittest.main()
