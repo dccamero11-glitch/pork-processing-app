@@ -304,6 +304,81 @@ class LabelReadingTests(unittest.TestCase):
                 self.assertEqual(profile["branch"], "ตรัง")
                 self.assertEqual(raised.exception.code, 403)
 
+    def test_order_validation_rejects_negative_and_unknown_products(self):
+        with self.assertRaisesRegex(ValueError, "ต้องไม่ติดลบ"):
+            app.prepare_order_items({"items": [{"product_name": "เนื้อแดง", "quantity": -1, "unit": "กก."}]})
+        with self.assertRaisesRegex(ValueError, "ชื่อสินค้าที่ไม่ถูกต้อง"):
+            app.prepare_order_items({"items": [{"product_name": "สินค้าอื่น", "quantity": 1, "unit": "กก."}]})
+
+    def test_order_endpoints_save_server_total_and_load_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "orders.db"):
+                app.init_db()
+                server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                    payload = {
+                        "branch": "บางบัวทอง",
+                        "note": "ขาหน้าขอน้ำหนักขาละ 1.70-1.90 กก.",
+                        "total_weight": 99999,
+                        "items": [
+                            {"product_name": "เนื้อแดง", "quantity": 100, "unit": "กก."},
+                            {"product_name": "สามชั้น", "quantity": 500, "unit": "กก."},
+                            {"product_name": "ขาหน้า", "quantity": 100, "unit": "กก."},
+                            {"product_name": "คากิ", "quantity": 0, "unit": "กก."},
+                        ],
+                    }
+                    request = urllib.request.Request(
+                        base_url + "/api/orders",
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        saved = json.load(response)
+                    query = urllib.parse.urlencode({"branch": "บางบัวทอง", "date": app.date.today().isoformat()})
+                    with urllib.request.urlopen(base_url + "/api/orders?" + query, timeout=3) as response:
+                        history = json.load(response)
+                    with urllib.request.urlopen(base_url + f"/api/orders/{saved['id']}", timeout=3) as response:
+                        detail = json.load(response)
+                    with urllib.request.urlopen(base_url + "/order.html", timeout=3) as response:
+                        order_page = response.read().decode("utf-8")
+                    with urllib.request.urlopen(base_url + "/order-history.html", timeout=3) as response:
+                        history_page = response.read().decode("utf-8")
+                finally:
+                    server.shutdown(); server.server_close(); thread.join(timeout=2)
+                self.assertEqual(saved["saved"], 3)
+                self.assertEqual(saved["total_weight"], 700)
+                self.assertEqual(history[0]["item_count"], 3)
+                self.assertEqual(history[0]["ordered_by"], "test-admin")
+                self.assertEqual(detail["total_weight"], 700)
+                self.assertEqual([item["product_name"] for item in detail["items"]], ["เนื้อแดง", "สามชั้น", "ขาหน้า"])
+                self.assertIn('id="orderRows"', order_page)
+                self.assertIn('id="orderHistoryRows"', history_page)
+
+    def test_manager_cannot_save_or_read_other_branch_orders(self):
+        manager = {"username": "manager_trang", "role": "manager", "branch": "ตรัง"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "manager-orders.db"):
+                app.init_db()
+                with mock.patch.object(app.Handler, "current_user", return_value=manager):
+                    server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                        payload = {"branch": "บางบัวทอง", "items": [{"product_name": "เนื้อแดง", "quantity": 1, "unit": "กก."}]}
+                        request = urllib.request.Request(base_url + "/api/orders", data=json.dumps(payload, ensure_ascii=False).encode(), headers={"Content-Type": "application/json"})
+                        with self.assertRaises(urllib.error.HTTPError) as save_error:
+                            urllib.request.urlopen(request, timeout=3)
+                        with self.assertRaises(urllib.error.HTTPError) as read_error:
+                            urllib.request.urlopen(base_url + "/api/orders?branch=" + urllib.parse.quote("บางบัวทอง"), timeout=3)
+                    finally:
+                        server.shutdown(); server.server_close(); thread.join(timeout=2)
+                self.assertEqual(save_error.exception.code, 403)
+                self.assertEqual(read_error.exception.code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

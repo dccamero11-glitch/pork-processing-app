@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -35,6 +36,13 @@ PRICE_PRODUCTS = {
     "เนื้อแดง", "สะโพก", "สามชั้น", "ซี่โครง", "ขาหน้า", "ขาหลัง", "สันนอก",
     "อกไก่", "น่องสะโพก",
 }
+ORDER_PRODUCTS = (
+    "เนื้อแดง", "สะโพก", "สามชั้น", "สามชั้นบาง", "สามชั้นลอกหนัง", "ซี่โครง",
+    "ซี่โครงอ่อน", "ซี่โครงแข็ง", "กระดูกอ่อน", "เอียวเล้ง", "ขาหน้า", "ขาหลัง",
+    "สันนอก", "สันใน", "สันคอ", "หมูบด", "หนังหมู", "มันหมู", "ไส้หมู",
+    "ไส้อ่อน", "ไส้ใหญ่", "ตับ", "หัวใจ", "ไต", "ม้าม", "ปอด", "กระเพาะหมู",
+    "เซี่ยงจี้", "หัวหมู", "หูหมู", "แก้มหมู", "ลิ้นหมู", "หางหมู", "คากิ",
+)
 
 
 def ai_is_configured():
@@ -83,6 +91,7 @@ def db():
 def init_db():
     with db() as conn:
         id_column = "BIGSERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        order_id_column = "BIGINT" if USE_POSTGRES else "INTEGER"
         conn.execute(f"""CREATE TABLE IF NOT EXISTS records(
             id {id_column},
             tx_date TEXT NOT NULL, branch TEXT NOT NULL, category TEXT NOT NULL,
@@ -100,6 +109,16 @@ def init_db():
             id {id_column}, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
             role TEXT NOT NULL, branch TEXT, active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS orders(
+            id {id_column}, order_date DATE NOT NULL, branch TEXT NOT NULL,
+            ordered_by TEXT NOT NULL, total_weight NUMERIC NOT NULL,
+            note TEXT NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS order_items(
+            id {id_column}, order_id {order_id_column} NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            product_name TEXT NOT NULL, quantity NUMERIC NOT NULL, unit TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
         )""")
     seed_users()
 
@@ -308,6 +327,28 @@ def prepare_record_rows(data, current_date=None):
     return rows
 
 
+def prepare_order_items(data):
+    rows = []
+    for item in data.get("items", []):
+        product_name = str(item.get("product_name", "")).strip()
+        if product_name not in ORDER_PRODUCTS:
+            raise ValueError("พบชื่อสินค้าที่ไม่ถูกต้อง")
+        try:
+            quantity = Decimal(str(item.get("quantity", 0) or 0))
+        except (InvalidOperation, ValueError):
+            raise ValueError("จำนวน/น้ำหนักต้องเป็นตัวเลข")
+        if not quantity.is_finite() or quantity < 0:
+            raise ValueError("จำนวน/น้ำหนักต้องไม่ติดลบ")
+        unit = str(item.get("unit", "กก.")).strip()
+        if unit != "กก.":
+            raise ValueError("หน่วยสินค้าไม่ถูกต้อง")
+        if quantity > 0:
+            rows.append((product_name, quantity, unit))
+    if not rows:
+        raise ValueError("กรุณากรอกสินค้าอย่างน้อย 1 รายการที่มีน้ำหนักมากกว่า 0")
+    return rows
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -368,6 +409,53 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if clean_path == "/api/me":
             self.send_json({"username": user["username"], "role": user["role"], "branch": user.get("branch")}); return
+        if clean_path.startswith("/api/orders/"):
+            try:
+                order_id = int(clean_path.rsplit("/", 1)[1])
+            except (TypeError, ValueError):
+                self.send_json({"message": "รหัสคำสั่งซื้อไม่ถูกต้อง"}, 400); return
+            with db() as conn:
+                order = conn.execute(
+                    "SELECT id,order_date,branch,ordered_by,total_weight,note,created_at FROM orders WHERE id=?",
+                    (order_id,),
+                ).fetchone()
+                if not order:
+                    self.send_json({"message": "ไม่พบคำสั่งซื้อ"}, 404); return
+                try: effective_branch(user, order["branch"])
+                except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+                items = [dict(row) for row in conn.execute(
+                    "SELECT product_name,quantity,unit FROM order_items WHERE order_id=? ORDER BY id",
+                    (order_id,),
+                )]
+            result = dict(order)
+            result["order_date"] = str(result["order_date"])
+            result["created_at"] = str(result["created_at"])
+            result["total_weight"] = float(result["total_weight"])
+            for item in items: item["quantity"] = float(item["quantity"])
+            result["items"] = items
+            self.send_json(result); return
+        if clean_path == "/api/orders":
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            branch = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
+            order_date = q.get("date", [""])[0]
+            try: branch = effective_branch(user, branch, allow_all=True)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+            if order_date:
+                try: datetime.strptime(order_date, "%Y-%m-%d")
+                except ValueError: self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
+            sql = """SELECT o.id,o.order_date,o.branch,o.ordered_by,o.total_weight,o.note,o.created_at,
+                COUNT(i.id) item_count FROM orders o LEFT JOIN order_items i ON i.order_id=o.id WHERE 1=1"""
+            params = []
+            if branch != "ALL": sql += " AND o.branch=?"; params.append(branch)
+            if order_date: sql += " AND o.order_date=?"; params.append(order_date)
+            sql += " GROUP BY o.id,o.order_date,o.branch,o.ordered_by,o.total_weight,o.note,o.created_at ORDER BY o.order_date DESC,o.id DESC"
+            with db() as conn: rows = [dict(row) for row in conn.execute(sql, params)]
+            for row in rows:
+                row["order_date"] = str(row["order_date"])
+                row["created_at"] = str(row["created_at"])
+                row["total_weight"] = float(row["total_weight"])
+            self.send_json(rows); return
         if self.path.startswith("/api/price-history"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -491,6 +579,28 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn:
                     conn.executemany("INSERT INTO records(tx_date,branch,category,product_name,weight_kg,image_data,created_at) VALUES(?,?,?,?,?,?,?)", valid)
                 self.send_json({"ok": True, "saved": len(valid)}); return
+            if self.path == "/api/orders":
+                branch = effective_branch(user, data.get("branch"))
+                order_items = prepare_order_items(data)
+                note = str(data.get("note", "")).strip()
+                if len(note) > 2000:
+                    raise ValueError("หมายเหตุยาวเกินไป")
+                total_weight = sum((item[1] for item in order_items), Decimal("0"))
+                now = datetime.now().isoformat(timespec="seconds")
+                stored_total = total_weight if USE_POSTGRES else float(total_weight)
+                with db() as conn:
+                    order_id = conn.execute(
+                        """INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at)
+                        VALUES(?,?,?,?,?,?) RETURNING id""",
+                        (date.today().isoformat(), branch, user["username"], stored_total, note, now),
+                    ).fetchone()["id"]
+                    conn.executemany(
+                        """INSERT INTO order_items(order_id,product_name,quantity,unit,created_at)
+                        VALUES(?,?,?,?,?)""",
+                        [(order_id, product_name, quantity if USE_POSTGRES else float(quantity), unit, now)
+                         for product_name, quantity, unit in order_items],
+                    )
+                self.send_json({"ok": True, "id": order_id, "saved": len(order_items), "total_weight": float(total_weight)}); return
             if self.path == "/api/competitor-prices":
                 price_date = data.get("date")
                 branch = effective_branch(user, data.get("branch"))
