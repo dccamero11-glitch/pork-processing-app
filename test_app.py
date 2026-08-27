@@ -454,5 +454,25 @@ class LabelReadingTests(unittest.TestCase):
         self.assertEqual(sum(row[1] for row in rows), 5)
 
 
+    def test_pork_processing_products_are_distinct_and_summarizable(self):
+        products = app.PORK_PROCESSING_PRODUCTS
+        self.assertEqual(len(products), 9)
+        self.assertEqual(len(products), len(set(products)))
+        self.assertIn("หมูแปรรูป", app.CATEGORIES)
+        self.assertIn("ปีกปลาย", products)
+        self.assertIn("ปลายปีก", products)
+        self.assertNotEqual(products.index("ปีกปลาย"), products.index("ปลายปีก"))
+        rows = app.prepare_record_rows({
+            "date": app.date.today().isoformat(), "branch": "บางบัวทอง", "category": "หมูแปรรูป",
+            "items": [
+                {"valid": True, "name": "แคปสะโพก", "weight": 20, "image": ""},
+                {"valid": True, "name": "หนังสัน", "weight": 10, "image": ""},
+                {"valid": True, "name": "เศษเนื้อ", "weight": 15, "image": ""},
+                {"valid": True, "name": "ชายหมูสามชั้น", "weight": 5, "image": ""},
+            ],
+        })
+        self.assertEqual(sum(row[4] for row in rows), 50)
+
+
 if __name__ == "__main__":
     unittest.main()
