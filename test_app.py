@@ -444,5 +444,15 @@ class LabelReadingTests(unittest.TestCase):
         self.assertTrue(set(app.SELLING_PRODUCTS["หมู"]).isdisjoint({"ไก่เนื้อล้วง(ตัว)","ไก่กลม(ตัว)"}))
 
 
+    def test_additional_pork_order_products_are_unique_and_accepted(self):
+        products = ("ม้าม", "ขั้วปอด", "คางหมู", "สามชั้นหนา", "ชายสามชั้น")
+        self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
+        rows = app.prepare_order_items({"items": [
+            {"product_name": name, "quantity": 1, "unit": "กก."} for name in products
+        ]})
+        self.assertEqual([row[0] for row in rows], list(products))
+        self.assertEqual(sum(row[1] for row in rows), 5)
+
+
 if __name__ == "__main__":
     unittest.main()
