@@ -460,12 +460,19 @@ class LabelReadingTests(unittest.TestCase):
         self.assertEqual(products, expected)
         self.assertEqual(len(products), 9)
         self.assertEqual(len(products), len(set(products)))
-        self.assertIn("หมูแปรรูป", app.CATEGORIES)
+        self.assertTrue(set(products).issubset(app.CATEGORIES))
+        self.assertNotIn("หมูแปรรูป", app.CATEGORIES)
+        self.assertEqual(len(app.CATEGORIES), len(set(app.CATEGORIES)))
+        app_js = (app.ROOT / "app.js").read_text(encoding="utf-8")
+        ui_categories = json.loads(app_js.split("CATEGORIES=", 1)[1].split("], PORK_PROCESSING_PRODUCTS", 1)[0] + "]")
+        self.assertTrue(set(products).issubset(ui_categories))
+        self.assertNotIn("หมูแปรรูป", ui_categories)
+        self.assertEqual(len(ui_categories), len(set(ui_categories)))
         self.assertIn("ปีกปลาย", products)
         self.assertIn("ปลายปีก", products)
         self.assertNotEqual(products.index("ปีกปลาย"), products.index("ปลายปีก"))
         rows = app.prepare_record_rows({
-            "date": app.date.today().isoformat(), "branch": "บางบัวทอง", "category": "หมูแปรรูป",
+            "date": app.date.today().isoformat(), "branch": "บางบัวทอง", "category": "แคปสะโพก",
             "items": [
                 {"valid": True, "name": "แคปสะโพก", "weight": 20, "image": ""},
                 {"valid": True, "name": "หนังสัน", "weight": 10, "image": ""},
