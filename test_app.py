@@ -321,6 +321,7 @@ class LabelReadingTests(unittest.TestCase):
                 try:
                     base_url = f"http://127.0.0.1:{server.server_address[1]}"
                     payload = {
+                        "request_id": "order-endpoint-test-1",
                         "branch": "บางบัวทอง",
                         "note": "ขาหน้าขอน้ำหนักขาละ 1.70-1.90 กก.",
                         "total_weight": 99999,
@@ -350,6 +351,8 @@ class LabelReadingTests(unittest.TestCase):
                 finally:
                     server.shutdown(); server.server_close(); thread.join(timeout=2)
                 self.assertEqual(saved["saved"], 3)
+                self.assertTrue(saved["success"])
+                self.assertEqual(saved["order_id"], saved["id"])
                 self.assertEqual(saved["total_weight"], 700)
                 self.assertEqual(history[0]["item_count"], 3)
                 self.assertEqual(history[0]["ordered_by"], "test-admin")
@@ -369,7 +372,7 @@ class LabelReadingTests(unittest.TestCase):
                     thread.start()
                     try:
                         base_url = f"http://127.0.0.1:{server.server_address[1]}"
-                        payload = {"branch": "บางบัวทอง", "items": [{"product_name": "เนื้อแดง", "quantity": 1, "unit": "กก."}]}
+                        payload = {"request_id": "manager-forbidden-1", "branch": "บางบัวทอง", "items": [{"product_name": "เนื้อแดง", "quantity": 1, "unit": "กก."}]}
                         request = urllib.request.Request(base_url + "/api/orders", data=json.dumps(payload, ensure_ascii=False).encode(), headers={"Content-Type": "application/json"})
                         with self.assertRaises(urllib.error.HTTPError) as save_error:
                             urllib.request.urlopen(request, timeout=3)
@@ -519,6 +522,53 @@ class LabelReadingTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             sheet=archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
         self.assertIn("สรุปการสั่งสินค้า",sheet);self.assertIn("เนื้อแดง",sheet)
+
+    def test_order_save_three_branches_is_idempotent_and_summary_totals_300(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app, "DB", Path(temp_dir) / "three-branches.db"):
+            app.init_db(); server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler); thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+            try:
+                base=f"http://127.0.0.1:{server.server_address[1]}"
+                saved=[]
+                for index, branch in enumerate(("บางบัวทอง","หลังสวน","ตรัง"),1):
+                    payload={"request_id":f"three-branch-{index}","branch":branch,"items":[{"product_name":"เนื้อแดง","quantity":100,"unit":"กก."}]}
+                    request=urllib.request.Request(base+"/api/orders",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                    with urllib.request.urlopen(request,timeout=3) as response:
+                        self.assertEqual(response.headers.get_content_type(),"application/json"); saved.append(json.load(response))
+                    if index == 1:
+                        with urllib.request.urlopen(request,timeout=3) as response: retried=json.load(response)
+                with urllib.request.urlopen(base+"/api/orders/summary?date="+app.date.today().isoformat()+"&branch=ALL",timeout=3) as response: summary=json.load(response)
+                with app.db() as conn:
+                    order_count=conn.execute("SELECT COUNT(*) count FROM orders").fetchone()["count"]
+                    item_count=conn.execute("SELECT COUNT(*) count FROM order_items").fetchone()["count"]
+            finally: server.shutdown();server.server_close();thread.join(timeout=2)
+            self.assertTrue(all(row["success"] and row["order_id"] for row in saved));self.assertTrue(retried["duplicate"]);self.assertEqual(retried["order_id"],saved[0]["order_id"])
+            self.assertEqual(order_count,3);self.assertEqual(item_count,3)
+            meat=next(row for row in summary["products"] if row["product_name"]=="เนื้อแดง")
+            self.assertEqual([meat[b] for b in ("บางบัวทอง","หลังสวน","ตรัง")],[100,100,100]);self.assertEqual(meat["total"],300)
+
+    def test_order_transaction_error_rolls_back_and_returns_json(self):
+        original_db=app.db
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"rollback.db"):
+            app.init_db()
+            @app.contextmanager
+            def failing_db():
+                with original_db() as connection:
+                    class FailingConnection:
+                        def execute(self,*args,**kwargs): return connection.execute(*args,**kwargs)
+                        def executemany(self,sql,params):
+                            if "INSERT INTO order_items" in sql: raise RuntimeError("forced database failure")
+                            return connection.executemany(sql,params)
+                    yield FailingConnection()
+            with mock.patch.object(app,"db",failing_db):
+                server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+                try:
+                    payload={"request_id":"rollback-1","branch":"บางบัวทอง","items":[{"product_name":"เนื้อแดง","quantity":100,"unit":"กก."}]}
+                    request=urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/api/orders",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                    with self.assertRaises(urllib.error.HTTPError) as raised: urllib.request.urlopen(request,timeout=3)
+                    error=json.load(raised.exception)
+                finally: server.shutdown();server.server_close();thread.join(timeout=2)
+            with original_db() as conn: count=conn.execute("SELECT COUNT(*) count FROM orders").fetchone()["count"]
+            self.assertEqual(raised.exception.code,500);self.assertFalse(error["success"]);self.assertNotIn("forced database failure",json.dumps(error));self.assertEqual(count,0)
 
 
 if __name__ == "__main__":

@@ -140,6 +140,10 @@ def init_db():
             product_name TEXT NOT NULL, quantity NUMERIC NOT NULL, unit TEXT NOT NULL,
             created_at TIMESTAMP NOT NULL
         )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS order_requests(
+            request_id TEXT PRIMARY KEY, order_id {order_id_column} NOT NULL REFERENCES orders(id),
+            created_at TIMESTAMP NOT NULL
+        )""")
         conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_prices(
             id {id_column}, product_category TEXT NOT NULL, product_name TEXT NOT NULL,
             purchase_cost NUMERIC(12,2) NOT NULL DEFAULT 0, transport_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -730,6 +734,9 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/orders":
                 branch = effective_branch(user, data.get("branch"))
                 order_items = prepare_order_items(data)
+                request_id = str(data.get("request_id", "")).strip()
+                if not request_id or len(request_id) > 100:
+                    raise ValueError("ไม่พบรหัสคำขอบันทึก กรุณาลองใหม่")
                 note = str(data.get("note", "")).strip()
                 if len(note) > 2000:
                     raise ValueError("หมายเหตุยาวเกินไป")
@@ -737,18 +744,30 @@ class Handler(SimpleHTTPRequestHandler):
                 now = datetime.now().isoformat(timespec="seconds")
                 stored_total = total_weight if USE_POSTGRES else float(total_weight)
                 with db() as conn:
-                    order_id = conn.execute(
-                        """INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at)
-                        VALUES(?,?,?,?,?,?) RETURNING id""",
-                        (date.today().isoformat(), branch, user["username"], stored_total, note, now),
-                    ).fetchone()["id"]
-                    conn.executemany(
-                        """INSERT INTO order_items(order_id,product_name,quantity,unit,created_at)
-                        VALUES(?,?,?,?,?)""",
-                        [(order_id, product_name, quantity if USE_POSTGRES else float(quantity), unit, now)
-                         for product_name, quantity, unit in order_items],
-                    )
-                self.send_json({"ok": True, "id": order_id, "saved": len(order_items), "total_weight": float(total_weight)}); return
+                    previous = conn.execute("SELECT order_id FROM order_requests WHERE request_id=?", (request_id,)).fetchone()
+                    if previous:
+                        order_id = previous["order_id"]
+                        existing = conn.execute("SELECT total_weight FROM orders WHERE id=?", (order_id,)).fetchone()
+                        response_total = float(existing["total_weight"])
+                        duplicate = True
+                    else:
+                        order_id = conn.execute(
+                            """INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at)
+                            VALUES(?,?,?,?,?,?) RETURNING id""",
+                            (date.today().isoformat(), branch, user["username"], stored_total, note, now),
+                        ).fetchone()["id"]
+                        conn.executemany(
+                            """INSERT INTO order_items(order_id,product_name,quantity,unit,created_at)
+                            VALUES(?,?,?,?,?)""",
+                            [(order_id, product_name, quantity if USE_POSTGRES else float(quantity), unit, now)
+                             for product_name, quantity, unit in order_items],
+                        )
+                        conn.execute("INSERT INTO order_requests(request_id,order_id,created_at) VALUES(?,?,?)", (request_id, order_id, now))
+                        response_total = float(total_weight)
+                        duplicate = False
+                self.send_json({"success": True, "message": "บันทึกคำสั่งซื้อสำเร็จ", "order_id": order_id,
+                                "id": order_id, "saved": len(order_items), "total_weight": response_total,
+                                "duplicate": duplicate}, 200 if duplicate else 201); return
             if self.path in ("/api/selling-prices", "/api/selling-prices/bulk"):
                 branch = effective_branch(user, data.get("branch"))
                 raw_items = data.get("items", []) if self.path.endswith("/bulk") else [data]
@@ -810,7 +829,9 @@ class Handler(SimpleHTTPRequestHandler):
         except PermissionError as exc:
             self.send_json({"message": str(exc)}, 403)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            self.send_json({"message": str(exc)}, 400)
+            self.send_json({"success": False, "error": str(exc), "message": str(exc)}, 400)
+        except Exception:
+            self.send_json({"success": False, "error": "บันทึกข้อมูลไม่สำเร็จ", "message": "บันทึกคำสั่งซื้อไม่สำเร็จ กรุณาลองใหม่"}, 500)
 
 
 class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
