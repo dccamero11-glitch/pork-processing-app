@@ -379,6 +379,47 @@ class LabelReadingTests(unittest.TestCase):
                 self.assertEqual(save_error.exception.code, 403)
                 self.assertEqual(read_error.exception.code, 403)
 
+    def test_selling_price_calculation_and_validation(self):
+        values = app.calculate_selling_price({"product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100,"transport_cost":5,"profit_percent":15,"calculated_price":1})
+        self.assertEqual(float(values[4]), 105)
+        self.assertEqual(float(values[7]), 120.75)
+        self.assertEqual(float(values[8]), 121)
+        values = app.calculate_selling_price({"product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100,"transport_cost":0,"profit_percent":10})
+        self.assertEqual(float(values[7]), 110)
+        for key in ("purchase_cost","transport_cost","profit_percent"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                app.calculate_selling_price({"product_category":"หมู","product_name":"เนื้อแดง",key:-1})
+
+    def test_selling_price_api_history_and_bulk_rollback(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"selling.db"):
+            app.init_db();server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                base=f"http://127.0.0.1:{server.server_address[1]}";payload={"branch":"บางบัวทอง","product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100,"transport_cost":5,"profit_percent":15,"calculated_price":1,"recommended_price":1}
+                req=urllib.request.Request(base+"/api/selling-prices",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                with urllib.request.urlopen(req,timeout=3) as response: self.assertEqual(json.load(response)["saved"],1)
+                q=urllib.parse.urlencode({"branch":"บางบัวทอง","category":"หมู"})
+                with urllib.request.urlopen(base+"/api/selling-prices?"+q,timeout=3) as response: current=json.load(response)
+                with urllib.request.urlopen(base+"/api/selling-price-history?"+q,timeout=3) as response: history=json.load(response)
+                self.assertEqual(current[0]["calculated_price"],120.75);self.assertEqual(current[0]["recommended_price"],121);self.assertEqual(len(history),1)
+                bulk={"branch":"บางบัวทอง","items":[{"product_category":"หมู","product_name":"สามชั้น","purchase_cost":10},{"product_category":"หมู","product_name":"ผิด","purchase_cost":10}]}
+                req=urllib.request.Request(base+"/api/selling-prices/bulk",data=json.dumps(bulk,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                with self.assertRaises(urllib.error.HTTPError): urllib.request.urlopen(req,timeout=3)
+                with app.db() as conn: self.assertEqual(conn.execute("SELECT COUNT(*) n FROM selling_prices WHERE product_name=?",("สามชั้น",)).fetchone()["n"],0)
+            finally: server.shutdown();server.server_close();thread.join(timeout=2)
+
+    def test_manager_cannot_bypass_selling_price_branch(self):
+        manager={"username":"manager_trang","role":"manager","branch":"ตรัง"}
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"selling-manager.db"):
+            app.init_db()
+            with mock.patch.object(app.Handler,"current_user",return_value=manager):
+                server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+                try:
+                    base=f"http://127.0.0.1:{server.server_address[1]}";payload={"branch":"บางบัวทอง","product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100}
+                    req=urllib.request.Request(base+"/api/selling-prices",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                    with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(req,timeout=3)
+                    self.assertEqual(error.exception.code,403)
+                finally: server.shutdown();server.server_close();thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

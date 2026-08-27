@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -43,6 +43,10 @@ ORDER_PRODUCTS = (
     "ไส้อ่อน", "ไส้ใหญ่", "ตับ", "หัวใจ", "ไต", "ม้าม", "ปอด", "กระเพาะหมู",
     "เซี่ยงจี้", "หัวหมู", "หูหมู", "แก้มหมู", "ลิ้นหมู", "หางหมู", "คากิ",
 )
+SELLING_PRODUCTS = {
+    "หมู": ("เนื้อแดง","สะโพก","สามชั้น","สามชั้นบาง","สามชั้นลอกหนัง","ซี่โครง","ซี่โครงอ่อน","ซี่โครงแข็ง","กระดูกอ่อน","เอียวเล้ง","ขาหน้า","ขาหลัง","สันนอก","สันใน","สันคอ","หมูบด","หนังหมู","มันหมู","ไส้หมู","ไส้อ่อน","ไส้ใหญ่","ตับหมู","หัวใจหมู","ไตหมู","ม้ามหมู","ปอดหมู","กระเพาะหมู","เซี่ยงจี้","หัวหมู","หูหมู","แก้มหมู","ลิ้นหมู","หางหมู","คากิ"),
+    "ไก่": ("ไก่สดทั้งตัว","อกไก่","สันในไก่","น่องไก่","สะโพกไก่","น่องสะโพก","ปีกบน","ปีกกลาง","ปีกเต็ม","ปลายปีก","โครงไก่","หนังไก่","ตับไก่","กึ๋นไก่","หัวใจไก่","ตีนไก่","คอไก่","หัวไก่"),
+}
 
 
 def ai_is_configured():
@@ -119,6 +123,21 @@ def init_db():
             id {id_column}, order_id {order_id_column} NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
             product_name TEXT NOT NULL, quantity NUMERIC NOT NULL, unit TEXT NOT NULL,
             created_at TIMESTAMP NOT NULL
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_prices(
+            id {id_column}, product_category TEXT NOT NULL, product_name TEXT NOT NULL,
+            purchase_cost NUMERIC(12,2) NOT NULL DEFAULT 0, transport_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
+            total_cost NUMERIC(12,2) NOT NULL DEFAULT 0, profit_percent NUMERIC(8,2) NOT NULL DEFAULT 0,
+            profit_amount NUMERIC(12,2) NOT NULL DEFAULT 0, calculated_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+            recommended_price NUMERIC(12,2) NOT NULL DEFAULT 0, branch TEXT NOT NULL,
+            updated_by TEXT NOT NULL, updated_at TIMESTAMP NOT NULL,
+            UNIQUE(branch,product_category,product_name)
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_price_history(
+            id {id_column}, product_category TEXT, product_name TEXT, purchase_cost NUMERIC(12,2),
+            transport_cost NUMERIC(12,2), total_cost NUMERIC(12,2), profit_percent NUMERIC(8,2),
+            calculated_price NUMERIC(12,2), recommended_price NUMERIC(12,2), branch TEXT,
+            changed_by TEXT, created_at TIMESTAMP NOT NULL
         )""")
     seed_users()
 
@@ -349,6 +368,26 @@ def prepare_order_items(data):
     return rows
 
 
+def calculate_selling_price(item):
+    category = str(item.get("product_category", "")).strip()
+    product = str(item.get("product_name", "")).strip()
+    if category not in SELLING_PRODUCTS or product not in SELLING_PRODUCTS[category]:
+        raise ValueError("หมวดหรือรายการสินค้าไม่ถูกต้อง")
+    values = []
+    for key in ("purchase_cost", "transport_cost", "profit_percent"):
+        try: value = Decimal(str(item.get(key, 0) or 0))
+        except (InvalidOperation, ValueError): raise ValueError("ราคาและกำไรต้องเป็นตัวเลข")
+        if not value.is_finite() or value < 0: raise ValueError("ราคาและกำไรต้องไม่ติดลบ")
+        values.append(value)
+    purchase, transport, profit_percent = values
+    total = purchase + transport
+    profit_amount = total * profit_percent / Decimal("100")
+    calculated = total + profit_amount
+    recommended = calculated.to_integral_value(rounding=ROUND_CEILING)
+    if recommended < total: raise ValueError("ราคาขายแนะนำต้องไม่ต่ำกว่าต้นทุนรวม")
+    return (category, product, purchase, transport, total, profit_percent, profit_amount, calculated, recommended)
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -455,6 +494,34 @@ class Handler(SimpleHTTPRequestHandler):
                 row["order_date"] = str(row["order_date"])
                 row["created_at"] = str(row["created_at"])
                 row["total_weight"] = float(row["total_weight"])
+            self.send_json(rows); return
+        if clean_path in ("/api/selling-prices", "/api/selling-price-history"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            branch = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
+            category = q.get("category", [""])[0]
+            product = q.get("product", [""])[0]
+            history_date = q.get("date", [""])[0]
+            try: branch = effective_branch(user, branch, allow_all=True)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+            if category and category not in SELLING_PRODUCTS: self.send_json({"message": "หมวดสินค้าไม่ถูกต้อง"}, 400); return
+            if history_date:
+                try: datetime.strptime(history_date, "%Y-%m-%d")
+                except ValueError: self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
+            table = "selling_price_history" if clean_path.endswith("history") else "selling_prices"
+            sql = f"SELECT * FROM {table} WHERE 1=1"; params = []
+            if branch != "ALL": sql += " AND branch=?"; params.append(branch)
+            if category: sql += " AND product_category=?"; params.append(category)
+            if product: sql += " AND product_name=?"; params.append(product)
+            if history_date: sql += " AND DATE(created_at)=?"; params.append(history_date)
+            sql += " ORDER BY " + ("created_at DESC,id DESC" if table.endswith("history") else "product_category,product_name")
+            with db() as conn: rows = [dict(row) for row in conn.execute(sql, params)]
+            numeric_fields=("purchase_cost","transport_cost","total_cost","profit_percent","profit_amount","calculated_price","recommended_price")
+            for row in rows:
+                for key in numeric_fields:
+                    if key in row and row[key] is not None: row[key]=float(row[key])
+                if "updated_at" in row: row["updated_at"]=str(row["updated_at"])
+                if "created_at" in row: row["created_at"]=str(row["created_at"])
             self.send_json(rows); return
         if self.path.startswith("/api/price-history"):
             from urllib.parse import urlparse, parse_qs
@@ -601,6 +668,25 @@ class Handler(SimpleHTTPRequestHandler):
                          for product_name, quantity, unit in order_items],
                     )
                 self.send_json({"ok": True, "id": order_id, "saved": len(order_items), "total_weight": float(total_weight)}); return
+            if self.path in ("/api/selling-prices", "/api/selling-prices/bulk"):
+                branch = effective_branch(user, data.get("branch"))
+                raw_items = data.get("items", []) if self.path.endswith("/bulk") else [data]
+                if not raw_items: raise ValueError("ไม่มีรายการสำหรับบันทึก")
+                calculated_items = [calculate_selling_price(item) for item in raw_items]
+                now = datetime.now().isoformat(timespec="seconds")
+                def stored(value): return value if USE_POSTGRES else float(value)
+                with db() as conn:
+                    for values in calculated_items:
+                        category, product, purchase, transport, total, profit_percent, profit_amount, calculated, recommended = values
+                        params = (category,product,stored(purchase),stored(transport),stored(total),stored(profit_percent),stored(profit_amount),stored(calculated),stored(recommended),branch,user["username"],now)
+                        conn.execute("""INSERT INTO selling_prices(product_category,product_name,purchase_cost,transport_cost,total_cost,profit_percent,profit_amount,calculated_price,recommended_price,branch,updated_by,updated_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(branch,product_category,product_name) DO UPDATE SET
+                            purchase_cost=excluded.purchase_cost,transport_cost=excluded.transport_cost,total_cost=excluded.total_cost,
+                            profit_percent=excluded.profit_percent,profit_amount=excluded.profit_amount,calculated_price=excluded.calculated_price,
+                            recommended_price=excluded.recommended_price,updated_by=excluded.updated_by,updated_at=excluded.updated_at""", params)
+                        conn.execute("""INSERT INTO selling_price_history(product_category,product_name,purchase_cost,transport_cost,total_cost,profit_percent,calculated_price,recommended_price,branch,changed_by,created_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (category,product,stored(purchase),stored(transport),stored(total),stored(profit_percent),stored(calculated),stored(recommended),branch,user["username"],now))
+                self.send_json({"ok":True,"saved":len(calculated_items)}); return
             if self.path == "/api/competitor-prices":
                 price_date = data.get("date")
                 branch = effective_branch(user, data.get("branch"))
