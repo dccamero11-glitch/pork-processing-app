@@ -456,6 +456,8 @@ class LabelReadingTests(unittest.TestCase):
 
     def test_pork_processing_products_are_distinct_and_summarizable(self):
         products = app.PORK_PROCESSING_PRODUCTS
+        expected = ("แคปสะโพก", "หนังสัน", "มันแข็ง", "ปีกบน", "ปีกกลาง", "ปีกปลาย", "ปลายปีก", "เศษเนื้อ", "ชายหมูสามชั้น")
+        self.assertEqual(products, expected)
         self.assertEqual(len(products), 9)
         self.assertEqual(len(products), len(set(products)))
         self.assertIn("หมูแปรรูป", app.CATEGORIES)
