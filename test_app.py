@@ -421,5 +421,16 @@ class LabelReadingTests(unittest.TestCase):
                 finally: server.shutdown();server.server_close();thread.join(timeout=2)
 
 
+    def test_expanded_order_products_are_unique_and_accepted(self):
+        names = ("สะโพกติดหนัง", "หมูบดA", "หมูหมักหมาล่า", "กระดูกอ่อน(โครงแก้ว)")
+        self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
+        rows = app.prepare_order_items({"items": [
+            {"product_name": name, "quantity": index + 1, "unit": "กก."}
+            for index, name in enumerate(names)
+        ]})
+        self.assertEqual([row[0] for row in rows], list(names))
+        self.assertEqual(sum(row[1] for row in rows), 10)
+
+
 if __name__ == "__main__":
     unittest.main()
