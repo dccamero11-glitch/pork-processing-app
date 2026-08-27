@@ -594,6 +594,26 @@ class LabelReadingTests(unittest.TestCase):
             translated=app.postgres_sql(statement)
             self.assertNotIn("?",translated);self.assertEqual(translated.count("%s"),statement.count("?"))
 
+    def test_postgres_wrapper_uses_cursor_executemany_not_connection(self):
+        calls=[]
+        class FakeCursor:
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+            def executemany(self,sql,params): calls.append((sql,list(params)))
+        class FakePostgresConnection:
+            def cursor(self): return FakeCursor()
+            def execute(self,sql,params=()): calls.append((sql,params));return FakeCursor()
+            def commit(self): calls.append(("commit",None))
+            def rollback(self): calls.append(("rollback",None))
+            def close(self): calls.append(("close",None))
+        fake_psycopg=type("FakePsycopg",(),{"connect":staticmethod(lambda *_args,**_kwargs:FakePostgresConnection())})
+        fake_rows=type("FakeRows",(),{"dict_row":object()})
+        with mock.patch.object(app,"USE_POSTGRES",True),mock.patch.object(app,"DATABASE_URL","postgresql://test"),mock.patch.dict(app.sys.modules if hasattr(app,"sys") else __import__('sys').modules,{"psycopg":fake_psycopg,"psycopg.rows":fake_rows}):
+            with app.db() as conn:
+                conn.executemany("INSERT INTO order_items(order_id,product_name,quantity,unit,created_at) VALUES(?,?,?,?,?)",[(1,"เนื้อแดง",100,"กก.","2026-08-27")])
+        insert=next(row for row in calls if isinstance(row[0],str) and row[0].startswith("INSERT INTO order_items"))
+        self.assertNotIn("?",insert[0]);self.assertEqual(insert[0].count("%s"),5);self.assertIn(("commit",None),calls)
+
 
 if __name__ == "__main__":
     unittest.main()

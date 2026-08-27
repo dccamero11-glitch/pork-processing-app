@@ -99,6 +99,10 @@ def db():
         def executemany(self, sql, params):
             if USE_POSTGRES:
                 sql = postgres_sql(sql)
+                # psycopg 3 exposes executemany on Cursor, not Connection.
+                with raw.cursor() as cursor:
+                    cursor.executemany(sql, params)
+                return None
             return raw.executemany(sql, params)
 
     try:
