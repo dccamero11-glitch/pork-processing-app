@@ -7,6 +7,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -492,6 +493,32 @@ class LabelReadingTests(unittest.TestCase):
         self.assertEqual(len(app.SELLING_PRODUCTS["ไก่"]), 24)
         self.assertNotIn("ไก่เนื้อล้วง(ตัว)", app.SELLING_PRODUCTS["หมู"])
         self.assertNotIn("เนื้อแดง", app.SELLING_PRODUCTS["ไก่"])
+
+
+    def test_order_summary_aggregates_branches_multiple_orders_and_notes(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app, "DB", Path(temp_dir) / "summary.db"):
+            app.init_db(); today = "2026-08-27"; now = "2026-08-27T08:00:00"
+            with app.db() as conn:
+                entries = [("บางบัวทอง","เนื้อแดง",100,"หมายเหตุบางบัวทอง"),("บางบัวทอง","เนื้อแดง",50,""),("หลังสวน","เนื้อแดง",100,"หมายเหตุหลังสวน"),("ตรัง","เนื้อแดง",100,"")]
+                for branch, product, quantity, note in entries:
+                    order_id = conn.execute("INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",(today,branch,"test-admin",quantity,note,now)).fetchone()["id"]
+                    conn.execute("INSERT INTO order_items(order_id,product_name,quantity,unit,created_at) VALUES(?,?,?,?,?)",(order_id,product,quantity,"กก.",now))
+            server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                url=f"http://127.0.0.1:{server.server_address[1]}/api/orders/summary?date={today}&branch=ALL"
+                with urllib.request.urlopen(url,timeout=3) as response: result=json.load(response)
+            finally: server.shutdown();server.server_close();thread.join(timeout=2)
+            meat=next(row for row in result["products"] if row["product_name"]=="เนื้อแดง")
+            self.assertEqual(meat["บางบัวทอง"],150);self.assertEqual(meat["หลังสวน"],100);self.assertEqual(meat["ตรัง"],100)
+            self.assertEqual(meat["total"],350);self.assertEqual(result["grand_total"],350)
+            self.assertEqual(result["notes"]["บางบัวทอง"],["หมายเหตุบางบัวทอง"])
+
+    def test_xlsx_export_is_real_zip_workbook_with_thai_text(self):
+        content=app.make_xlsx("สรุปการสั่งสินค้า",[["วันที่","2026-08-27"]],[["รายการสินค้า","รวม"],["เนื้อแดง",100.0]])
+        self.assertTrue(content.startswith(b"PK"))
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            sheet=archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn("สรุปการสั่งสินค้า",sheet);self.assertIn("เนื้อแดง",sheet)
 
 
 if __name__ == "__main__":

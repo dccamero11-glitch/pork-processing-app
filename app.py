@@ -11,12 +11,15 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+import io
+import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "processing.db"
@@ -26,7 +29,8 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "10000"))
 APP_ENV = os.environ.get("APP_ENV", "development").lower()
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "local-development-secret-change-before-production")
-BRANCHES = {"บางบัวทอง", "หลังสวน", "ตรัง"}
+BRANCH_ORDER = ("บางบัวทอง", "หลังสวน", "ตรัง")
+BRANCHES = set(BRANCH_ORDER)
 CATEGORIES = {
     "หมูบด A", "หมูบด B", "หมูบด 5", "หมูบดผสมไก่", "หมูอ้วนหมูบด(หมูบด6)",
     "ขาหน้าล้วน", "ขาหลังล้วน", "ขาหลังเลาะ", "คากิ", "คาตั้งกลม", "เครื่องในต้ม",
@@ -401,6 +405,32 @@ def calculate_selling_price(item):
     return (category, product, purchase, transport, total, profit_percent, profit_amount, calculated, recommended)
 
 
+def make_xlsx(title, metadata, rows):
+    sheet_rows = [[title]] + [[str(key), str(value)] for key, value in metadata] + [[]] + rows
+    xml_rows = []
+    for row_number, row in enumerate(sheet_rows, 1):
+        cells = []
+        for column_number, value in enumerate(row, 1):
+            column = ""; number = column_number
+            while number: number, remainder = divmod(number - 1, 26); column = chr(65 + remainder) + column
+            ref = f"{column}{row_number}"
+            if isinstance(value, (int, float)) and not isinstance(value, bool): cells.append(f'<c r="{ref}"><v>{value}</v></c>')
+            else: cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(str(value or ""))}</t></is></c>')
+        xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+    worksheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + "".join(xml_rows) + '</sheetData></worksheet>'
+    files = {
+        '[Content_Types].xml': '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+        '_rels/.rels': '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        'xl/workbook.xml': '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="รายงาน" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        'xl/_rels/workbook.xml.rels': '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+        'xl/worksheets/sheet1.xml': worksheet,
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items(): archive.writestr(name, content.encode("utf-8"))
+    return output.getvalue()
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -413,6 +443,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_file(self, body, filename):
+        self.send_response(200); self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"'); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
 
     def end_headers(self):
         if not self.path.startswith("/api/"):
@@ -463,6 +498,31 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"username": user["username"], "role": user["role"], "branch": user.get("branch")}); return
         if clean_path == "/api/product-catalog":
             self.send_json({"pork": list(ORDER_PRODUCTS)}); return
+        if clean_path == "/api/orders/summary":
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query); order_date = q.get("date", [date.today().isoformat()])[0]
+            requested = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
+            try: datetime.strptime(order_date, "%Y-%m-%d")
+            except ValueError: self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
+            try: selected = effective_branch(user, requested, allow_all=True)
+            except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
+            sql = """SELECT i.product_name,o.branch,SUM(i.quantity) quantity FROM orders o JOIN order_items i ON i.order_id=o.id WHERE o.order_date=?"""; params=[order_date]
+            if selected != "ALL": sql += " AND o.branch=?"; params.append(selected)
+            sql += " GROUP BY i.product_name,o.branch"
+            note_sql = "SELECT branch,note,created_at FROM orders WHERE order_date=? AND TRIM(note)<>''"; note_params=[order_date]
+            if selected != "ALL": note_sql += " AND branch=?"; note_params.append(selected)
+            note_sql += " ORDER BY branch,created_at"
+            with db() as conn:
+                aggregates=[dict(row) for row in conn.execute(sql,params)]; note_rows=[dict(row) for row in conn.execute(note_sql,note_params)]
+            visible_branches = list(BRANCH_ORDER) if selected == "ALL" else [selected]
+            branch_totals={branch:0.0 for branch in visible_branches}; product_map={name:{branch:0.0 for branch in visible_branches} for name in ORDER_PRODUCTS}
+            for row in aggregates:
+                quantity=float(row["quantity"]); product_map.setdefault(row["product_name"],{branch:0.0 for branch in visible_branches})[row["branch"]]=quantity; branch_totals[row["branch"]]+=quantity
+            products=[]
+            for name, values in product_map.items(): products.append({"product_name":name,**values,"total":sum(values.values())})
+            notes={branch:[] for branch in visible_branches}
+            for row in note_rows: notes[row["branch"]].append(row["note"])
+            self.send_json({"date":order_date,"visible_branches":visible_branches,"branches":branch_totals,"grand_total":sum(branch_totals.values()),"products":products,"notes":notes}); return
         if clean_path.startswith("/api/orders/"):
             try:
                 order_id = int(clean_path.rsplit("/", 1)[1])
@@ -655,6 +715,12 @@ class Handler(SimpleHTTPRequestHandler):
                 except VisionAPIError as exc:
                     self.send_json({"ok": False, "error_code": exc.code, "message": exc.message}, exc.http_status)
                 return
+            if self.path == "/api/export-xlsx":
+                title=str(data.get("title", "รายงาน"))[:120]; filename=str(data.get("filename", "report.xlsx"))
+                if not filename.endswith(".xlsx") or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for char in filename): filename="report.xlsx"
+                metadata=data.get("metadata", []); rows=data.get("rows", [])
+                if not isinstance(metadata,list) or not isinstance(rows,list) or len(rows)>5000 or any(not isinstance(row,list) or len(row)>100 for row in rows): raise ValueError("ข้อมูล Export ไม่ถูกต้องหรือมีขนาดใหญ่เกินไป")
+                self.send_file(make_xlsx(title,metadata,rows),filename); return
             if self.path == "/api/records":
                 data["branch"] = effective_branch(user, data.get("branch"))
                 valid = prepare_record_rows(data)
