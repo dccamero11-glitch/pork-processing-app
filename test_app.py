@@ -474,5 +474,16 @@ class LabelReadingTests(unittest.TestCase):
         self.assertEqual(sum(row[4] for row in rows), 50)
 
 
+    def test_selling_pork_catalog_uses_ordering_names_only(self):
+        self.assertIs(app.SELLING_PRODUCTS["หมู"], app.ORDER_PRODUCTS)
+        self.assertEqual(len(app.ORDER_PRODUCTS), 80)
+        self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
+        for name in ("เนื้อแดง", "สะโพก", "สามชั้น", "สามชั้นบาง"):
+            self.assertIn(name, app.SELLING_PRODUCTS["หมู"])
+        self.assertEqual(len(app.SELLING_PRODUCTS["ไก่"]), 24)
+        self.assertNotIn("ไก่เนื้อล้วง(ตัว)", app.SELLING_PRODUCTS["หมู"])
+        self.assertNotIn("เนื้อแดง", app.SELLING_PRODUCTS["ไก่"])
+
+
 if __name__ == "__main__":
     unittest.main()
