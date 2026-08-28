@@ -1,0 +1,7 @@
+processing.db
+*.db
+.env
+backups/
+__pycache__/
+*.pyc
+test_app.py
