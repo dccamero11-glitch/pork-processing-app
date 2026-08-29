@@ -1029,6 +1029,14 @@ class Handler(SimpleHTTPRequestHandler):
                 }, 200 if duplicate else 201); return
 
             if self.path == "/api/orders":
+
+                allowed_order_products = allowed_order_products
+                chicken_products = globals().get("CHICKEN_PRODUCTS", ())
+                if not chicken_products:
+                    selling_products = globals().get("SELLING_PRODUCTS", {})
+                    if isinstance(selling_products, dict):
+                        chicken_products = selling_products.get("ไก่", ())
+                allowed_order_products.update(chicken_products or ())
                 order_stage = "validate_payload"
                 branch = effective_branch(user, data.get("branch"))
                 order_items = prepare_order_items(data)
