@@ -199,6 +199,8 @@ def seed_users():
         ("manager_bangbuathong", "MANAGER_BANGBUATHONG_PASSWORD", "manager123", "manager", "บางบัวทอง"),
         ("manager_trang", "MANAGER_TRANG_PASSWORD", "manager123", "manager", "ตรัง"),
         ("manager_langsuan", "MANAGER_LANGSUAN_PASSWORD", "manager123", "manager", "หลังสวน"),
+        ("accounting", "ACCOUNTING_PASSWORD", "accounting123", "accounting", None),
+        ("audit", "AUDIT_PASSWORD", "audit123", "audit", None),
     ]
     with db() as conn:
         for username, env_name, default_password, role, branch in accounts:
