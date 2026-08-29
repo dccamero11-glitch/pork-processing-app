@@ -7,14 +7,34 @@ function render(){ORDER_PRODUCTS.splice(0,ORDER_PRODUCTS.length,...(ORDER_CATALO
 function reset(){state.quantities={};$("orderNote").value="";$("orderNotice").innerHTML="";render();summary()}
 $("orderSearch").oninput=render;$("clearOrderSearch").onclick=()=>{$("orderSearch").value="";render()};$("orderBranch").onchange=summary;$("clearOrder").onclick=()=>{if(confirm("ล้างข้อมูลคำสั่งซื้อทั้งหมดหรือไม่?"))reset()};
 $("saveOrder").onclick=async()=>{const button=$("saveOrder"),branch=$("orderBranch").value,rows=items(),note=$("orderNote").value,total=rows.reduce((s,x)=>s+x.quantity,0);if(!branch)return alert("กรุณาเลือกสาขา");if(!rows.length)return alert("กรุณากรอกสินค้าอย่างน้อย 1 รายการที่มีน้ำหนักมากกว่า 0");if(!confirm(`ยืนยันบันทึกคำสั่งซื้อของสาขา ${branch} น้ำหนักรวม ${total.toFixed(2)} กก. หรือไม่?`))return;const signature=JSON.stringify({branch,note,items:rows});if(state.pendingSignature!==signature){state.pendingSignature=signature;state.pendingRequestId=globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random()}`}const request_id=state.pendingRequestId;button.disabled=true;try{const result=await api('/api/orders',{method:'POST',body:JSON.stringify({request_id,branch,note,items:rows})});state.pendingRequestId=null;state.pendingSignature=null;reset();$("orderNotice").innerHTML=`<div class="save-success">บันทึกคำสั่งซื้อสำเร็จ (Order ID: ${esc(result.order_id)})</div>`}catch(e){$("orderNotice").innerHTML=`<div class="alert">${esc(e.message)}</div>`}finally{button.disabled=false}};
+
+
 function selectCategory(category){
-currentOrderCategory=category;
-document.querySelectorAll("[data-order-category]").forEach(b=>b.classList.toggle("active",b.dataset.orderCategory===category));
-const heading=document.querySelector(".order-layout .card:nth-child(2) h2");
-if(heading) heading.textContent="รายการ"+category;
-const search=$("orderSearch");
-if(search){search.value="";search.placeholder="ค้นหารายการ"+category+"...";}
-render();
+  currentOrderCategory = category;
+
+  document.querySelectorAll("[data-order-category]").forEach(function(button){
+    button.classList.toggle("active", button.dataset.orderCategory === category);
+  });
+
+  const products = ORDER_CATALOG[category] || [];
+  ORDER_PRODUCTS.splice(0, ORDER_PRODUCTS.length, ...products);
+
+  const title = document.querySelector(".order-layout .card:nth-child(2) h2");
+  if (title) title.textContent = "รายการ" + category;
+
+  const search = document.getElementById("orderSearch");
+  if (search) {
+    search.value = "";
+    search.placeholder = "ค้นหารายการ" + category + "...";
+  }
+
+  render();
 }
-document.querySelectorAll("[data-order-category]").forEach(button=>button.onclick=()=>selectCategory(button.dataset.orderCategory));
-window.authReady.then(async user=>{const catalog=await api('/api/product-catalog');ORDER_CATALOG["หมู"].push(...(catalog.pork||[]));ORDER_CATALOG["ไก่"].push(...(catalog.chicken||[]));$("orderDate").textContent=new Intl.DateTimeFormat("th-TH",{dateStyle:"long"}).format(new Date());$("orderedBy").textContent=user.username;if(user.role==='manager'){$("orderBranch").value=user.branch;$("orderBranch").disabled=true}selectCategory("หมู");summary()});
+
+document.querySelectorAll("[data-order-category]").forEach(function(button){
+  button.addEventListener("click", function(){
+    selectCategory(button.dataset.orderCategory);
+  });
+});
+
+window.authReady.then(async user=>{const catalog=await api('/api/product-catalog');ORDER_CATALOG["หมู"] = catalog.pork || []; ORDER_CATALOG["ไก่"] = catalog.chicken || [];$("orderDate").textContent=new Intl.DateTimeFormat("th-TH",{dateStyle:"long"}).format(new Date());$("orderedBy").textContent=user.username;if(user.role==='manager'){$("orderBranch").value=user.branch;$("orderBranch").disabled=true}selectCategory("หมู"); summary()});
