@@ -563,7 +563,7 @@ class Handler(SimpleHTTPRequestHandler):
                 ]
             self.send_json(rows); return
         if clean_path == "/api/product-catalog":
-            self.send_json({"pork": list(ORDER_PRODUCTS)}); return
+            self.send_json({"pork": list(ORDER_PRODUCTS), "chicken": list(SELLING_PRODUCTS.get("ไก่", ())) }); return
         if clean_path == "/api/receipts/summary":
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
