@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>จัดการผู้ใช้</title>
+  <link rel="stylesheet" href="styles.css?v=20260829">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>จัดการผู้ใช้</h1>
+      <p>จัดการบัญชีผู้ใช้งานและเปลี่ยนรหัสผ่าน</p>
+      <nav>
+        <a class="nav-link" href="/">บันทึกการแปรรูป</a>
+        <a class="nav-link" href="/order.html">สั่งสินค้า</a>
+        <a class="nav-link" href="/order-history.html">ประวัติการสั่งสินค้า</a>
+        <a class="nav-link" href="/receiving.html">รับสินค้าเข้า</a>
+        <a class="nav-link" href="/receiving-history.html">ประวัติรับสินค้า</a>
+        <a class="nav-link" href="/selling-price.html">คำนวณราคาขาย</a>
+        <a class="nav-link" href="/price-comparison.html">เทียบราคาคู่แข่ง</a>
+        <a class="nav-link" href="/overview.html">สรุปภาพรวม</a>
+        <a class="nav-link" href="/price-history.html">ประวัติราคา</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>รายชื่อผู้ใช้งาน</h2>
+      <div id="userTableWrapper" style="overflow-x:auto;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left; padding:10px; border-bottom:1px solid #d0d7de;">Username</th>
+              <th style="text-align:left; padding:10px; border-bottom:1px solid #d0d7de;">Role</th>
+              <th style="text-align:left; padding:10px; border-bottom:1px solid #d0d7de;">Branch</th>
+            </tr>
+          </thead>
+          <tbody id="userTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>เปลี่ยนรหัสผ่าน</h2>
+      <form id="passwordForm">
+        <label>บัญชีผู้ใช้</label>
+        <select id="userSelect" required></select>
+
+        <label>รหัสผ่านใหม่</label>
+        <input id="newPassword" type="password" autocomplete="new-password" required>
+
+        <label>ยืนยันรหัสผ่านใหม่</label>
+        <input id="confirmPassword" type="password" autocomplete="new-password" required>
+
+        <div class="actions" style="margin-top:16px;">
+          <button id="changePasswordBtn" type="submit" class="primary">เปลี่ยนรหัสผ่าน</button>
+        </div>
+
+        <div id="statusMessage" style="margin-top:16px; min-height:24px; font-weight:700;" aria-live="polite"></div>
+      </form>
+    </section>
+  </main>
+
+  <script src="auth.js?v=20260829"></script>
+  <script src="admin-users.js?v=20260829"></script>
+</body>
+</html>
