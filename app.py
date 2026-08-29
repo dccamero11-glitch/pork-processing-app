@@ -159,6 +159,35 @@ def init_db():
         # Safe, repeatable migration for databases created before idempotent order saves.
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_order_requests_request_id ON order_requests(request_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_order_requests_order_id ON order_requests(order_id)")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS receipts(
+            id {id_column},
+            receipt_number TEXT NOT NULL UNIQUE,
+            received_date DATE NOT NULL,
+            branch TEXT NOT NULL,
+            supplier TEXT NOT NULL DEFAULT '',
+            purchase_order_number TEXT NOT NULL DEFAULT '',
+            received_by TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            recorded_by TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS receipt_items(
+            id {id_column},
+            receipt_id {order_id_column} NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+            product_category TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            weight_kg NUMERIC NOT NULL,
+            bag_count INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMP NOT NULL
+        )""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS receipt_requests(
+            request_id TEXT PRIMARY KEY,
+            receipt_id {order_id_column} NOT NULL REFERENCES receipts(id),
+            created_at TIMESTAMP NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipts_date_branch ON receipts(received_date,branch)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt_id ON receipt_items(receipt_id)")
         conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_prices(
             id {id_column}, product_category TEXT NOT NULL, product_name TEXT NOT NULL,
             purchase_cost NUMERIC(12,2) NOT NULL DEFAULT 0, transport_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -516,7 +545,104 @@ class Handler(SimpleHTTPRequestHandler):
         if clean_path == "/api/me":
             self.send_json({"username": user["username"], "role": user["role"], "branch": user.get("branch")}); return
         if clean_path == "/api/product-catalog":
-            self.send_json({"pork": list(ORDER_PRODUCTS)}); return
+            chicken_products = globals().get("CHICKEN_PRODUCTS", ())
+            if not chicken_products:
+                selling = globals().get("SELLING_PRODUCTS", {})
+                if isinstance(selling, dict):
+                    chicken_products = selling.get("\u0e44\u0e01\u0e48", ())
+            self.send_json({"pork": list(ORDER_PRODUCTS), "chicken": list(chicken_products or ())}); return
+        if clean_path == "/api/receipts/summary":
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            date_from = q.get("date_from", [date.today().isoformat()])[0]
+            date_to = q.get("date_to", [date.today().isoformat()])[0]
+            requested = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
+            category = q.get("category", [""])[0].strip()
+            product = q.get("product", [""])[0].strip()
+
+            try:
+                datetime.strptime(date_from, "%Y-%m-%d")
+                datetime.strptime(date_to, "%Y-%m-%d")
+            except ValueError:
+                self.send_json({"message": "Invalid date format"}, 400); return
+
+            if date_from > date_to:
+                self.send_json({"message": "Start date must not be after end date"}, 400); return
+
+            try:
+                selected = effective_branch(user, requested, allow_all=True)
+            except PermissionError as exc:
+                self.send_json({"message": str(exc)}, 403); return
+
+            where = ["r.received_date BETWEEN ? AND ?"]
+            params = [date_from, date_to]
+
+            if selected != "ALL":
+                where.append("r.branch=?")
+                params.append(selected)
+            if category:
+                where.append("i.product_category=?")
+                params.append(category)
+            if product:
+                where.append("i.product_name=?")
+                params.append(product)
+
+            where_sql = " AND ".join(where)
+
+            summary_sql = f"""SELECT
+                i.product_name,
+                i.product_category,
+                r.branch,
+                SUM(i.weight_kg) total_weight,
+                SUM(i.bag_count) total_bags
+                FROM receipts r
+                JOIN receipt_items i ON i.receipt_id=r.id
+                WHERE {where_sql}
+                GROUP BY i.product_name,i.product_category,r.branch
+                ORDER BY r.branch,i.product_category,i.product_name"""
+
+            export_sql = f"""SELECT
+                r.received_date,
+                r.created_at,
+                r.branch,
+                i.product_category,
+                i.product_name,
+                i.weight_kg,
+                i.bag_count total_bags,
+                r.recorded_by
+                FROM receipts r
+                JOIN receipt_items i ON i.receipt_id=r.id
+                WHERE {where_sql}
+                ORDER BY r.received_date DESC,r.id DESC,i.id"""
+
+            with db() as conn:
+                rows = [dict(x) for x in conn.execute(summary_sql, params)]
+                export_rows = [dict(x) for x in conn.execute(export_sql, params)]
+
+            total_weight = 0.0
+            total_bags = 0
+            for row in rows:
+                row["total_weight"] = float(row["total_weight"] or 0)
+                row["total_bags"] = int(row["total_bags"] or 0)
+                total_weight += row["total_weight"]
+                total_bags += row["total_bags"]
+
+            for row in export_rows:
+                row["received_date"] = str(row["received_date"])
+                row["created_at"] = str(row["created_at"])
+                row["weight_kg"] = float(row["weight_kg"] or 0)
+                row["total_bags"] = int(row["total_bags"] or 0)
+
+            self.send_json({
+                "rows": rows,
+                "totals": {
+                    "item_count": len(rows),
+                    "total_weight": total_weight,
+                    "total_bags": total_bags
+                },
+                "export_rows": export_rows
+            }); return
+
         if clean_path == "/api/orders/summary":
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query); order_date = q.get("date", [date.today().isoformat()])[0]
@@ -747,6 +873,124 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn:
                     conn.executemany("INSERT INTO records(tx_date,branch,category,product_name,weight_kg,image_data,created_at) VALUES(?,?,?,?,?,?,?)", valid)
                 self.send_json({"ok": True, "saved": len(valid)}); return
+            if self.path == "/api/receipts":
+                branch = effective_branch(user, data.get("branch"))
+                received_date = str(data.get("received_date", "")).strip()
+                try:
+                    datetime.strptime(received_date, "%Y-%m-%d")
+                except ValueError:
+                    raise ValueError("Invalid received date")
+
+                supplier = str(data.get("supplier", "")).strip()[:300]
+                purchase_order_number = str(data.get("purchase_order_number", "")).strip()[:200]
+                received_by = str(data.get("received_by", "")).strip()[:200] or user["username"]
+                note = str(data.get("note", "")).strip()
+                request_id = str(data.get("request_id", "")).strip()
+                raw_items = data.get("items", [])
+
+                if not request_id or len(request_id) > 100:
+                    raise ValueError("Missing request id")
+                if not isinstance(raw_items, list) or not raw_items:
+                    raise ValueError("No receipt items")
+                if len(raw_items) > 1000:
+                    raise ValueError("Too many receipt items")
+                if len(note) > 2000:
+                    raise ValueError("Receipt note is too long")
+
+                valid_items = []
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        raise ValueError("Invalid receipt item")
+
+                    product_category = str(item.get("product_category", "")).strip()
+                    product_name = str(item.get("product_name", "")).strip()
+                    item_note = str(item.get("note", "")).strip()[:1000]
+
+                    if product_category not in ("\u0e2b\u0e21\u0e39", "\u0e44\u0e01\u0e48"):
+                        raise ValueError("Invalid product category")
+                    if not product_name:
+                        raise ValueError("Missing product name")
+
+                    try:
+                        weight = Decimal(str(item.get("weight_kg", "")))
+                        bags = int(item.get("bag_count", 0))
+                    except Exception:
+                        raise ValueError("Invalid weight or bag count")
+
+                    if not weight.is_finite() or weight <= 0:
+                        raise ValueError("Weight must be greater than zero")
+                    if bags < 0:
+                        raise ValueError("Bag count cannot be negative")
+
+                    valid_items.append((product_category, product_name, weight, bags, item_note))
+
+                now = datetime.now().isoformat(timespec="seconds")
+                receipt_number = None
+                duplicate = False
+
+                with db() as conn:
+                    previous = conn.execute(
+                        "SELECT receipt_id FROM receipt_requests WHERE request_id=?",
+                        (request_id,)
+                    ).fetchone()
+
+                    if previous:
+                        receipt_id = previous["receipt_id"]
+                        existing = conn.execute(
+                            "SELECT receipt_number FROM receipts WHERE id=?",
+                            (receipt_id,)
+                        ).fetchone()
+                        if not existing:
+                            raise ValueError("Receipt request is inconsistent")
+                        receipt_number = existing["receipt_number"]
+                        duplicate = True
+                    else:
+                        receipt_number = "RCV-" + received_date.replace("-", "") + "-" + secrets.token_hex(4).upper()
+
+                        receipt_id = conn.execute(
+                            """INSERT INTO receipts(
+                                receipt_number,received_date,branch,supplier,
+                                purchase_order_number,received_by,note,recorded_by,created_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id""",
+                            (
+                                receipt_number, received_date, branch, supplier,
+                                purchase_order_number, received_by, note,
+                                user["username"], now
+                            )
+                        ).fetchone()["id"]
+
+                        conn.executemany(
+                            """INSERT INTO receipt_items(
+                                receipt_id,product_category,product_name,
+                                weight_kg,bag_count,note,created_at
+                            ) VALUES(?,?,?,?,?,?,?)""",
+                            [
+                                (
+                                    receipt_id,
+                                    category,
+                                    product,
+                                    weight if USE_POSTGRES else float(weight),
+                                    bags,
+                                    item_note,
+                                    now
+                                )
+                                for category, product, weight, bags, item_note in valid_items
+                            ]
+                        )
+
+                        conn.execute(
+                            "INSERT INTO receipt_requests(request_id,receipt_id,created_at) VALUES(?,?,?)",
+                            (request_id, receipt_id, now)
+                        )
+
+                self.send_json({
+                    "success": True,
+                    "receipt_id": receipt_id,
+                    "receipt_number": receipt_number,
+                    "saved": len(valid_items),
+                    "duplicate": duplicate
+                }, 200 if duplicate else 201); return
+
             if self.path == "/api/orders":
                 order_stage = "validate_payload"
                 branch = effective_branch(user, data.get("branch"))
