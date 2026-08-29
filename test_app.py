@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -221,6 +222,75 @@ class LabelReadingTests(unittest.TestCase):
                 self.assertEqual(summary[0]["category"], "หมูบด A")
                 self.assertEqual(summary[0]["product_name"], "หมูสามชั้นบาง")
                 self.assertAlmostEqual(summary[0]["weight_kg"], 2.39)
+
+    def test_admin_can_manage_passwords_and_other_roles_are_forbidden(self):
+        os.environ.pop("APP_TESTING", None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "user-management.db"):
+                app.init_db()
+                server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                    admin_token = app.create_session({"username": "admin", "role": "admin", "branch": None, "exp": int(time.time()) + 3600})
+                    with urllib.request.urlopen(urllib.request.Request(
+                        base_url + "/api/users",
+                        headers={"Cookie": f"processing_session={admin_token}"},
+                    ), timeout=3) as response:
+                        users = json.load(response)
+                    self.assertIn("manager_bangbuathong", {user["username"] for user in users})
+                    self.assertNotIn("password_hash", users[0])
+
+                    request = urllib.request.Request(
+                        base_url + "/api/users/change-password",
+                        data=json.dumps({"username": "manager_bangbuathong", "new_password": "newpass123", "confirm_password": "newpass123"}, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "Cookie": f"processing_session={admin_token}"},
+                    )
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        result = json.load(response)
+                    self.assertEqual(result["message"], "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว")
+
+                    manager_token = app.create_session({"username": "manager_trang", "role": "manager", "branch": "ตรัง", "exp": int(time.time()) + 3600})
+                    forbidden = urllib.request.Request(
+                        base_url + "/api/users/change-password",
+                        data=json.dumps({"username": "manager_bangbuathong", "new_password": "x", "confirm_password": "x"}, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "Cookie": f"processing_session={manager_token}"},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(forbidden, timeout=3)
+                    self.assertEqual(raised.exception.code, 403)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+    def test_admin_users_endpoint_lists_real_database_users(self):
+        os.environ.pop("APP_TESTING", None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "users-list.db"):
+                app.init_db()
+                server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                    admin_token = app.create_session({"username": "admin", "role": "admin", "branch": None, "exp": int(time.time()) + 3600})
+                    with urllib.request.urlopen(urllib.request.Request(
+                        base_url + "/api/users",
+                        headers={"Cookie": f"processing_session={admin_token}"},
+                    ), timeout=3) as response:
+                        users = json.load(response)
+                    usernames = {user["username"] for user in users}
+                    self.assertIn("admin", usernames)
+                    self.assertIn("manager_bangbuathong", usernames)
+                    self.assertIn("manager_trang", usernames)
+                    self.assertIn("manager_langsuan", usernames)
+                    self.assertNotIn("password_hash", users[0])
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
 
     def test_competitor_prices_save_and_load_by_branch_and_date(self):
         with tempfile.TemporaryDirectory() as temp_dir:

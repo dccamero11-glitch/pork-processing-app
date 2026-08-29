@@ -515,6 +515,22 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if clean_path == "/api/me":
             self.send_json({"username": user["username"], "role": user["role"], "branch": user.get("branch")}); return
+        if clean_path == "/api/users":
+            if user.get("role") != "admin":
+                self.send_json({"message": "ไม่มีสิทธิ์เข้าถึง"}, 403); return
+            with db() as conn:
+                rows = [
+                    {
+                        "username": row["username"],
+                        "role": row["role"],
+                        "branch": row["branch"],
+                        "active": bool(row["active"]),
+                    }
+                    for row in conn.execute(
+                        "SELECT username, role, branch, active FROM users WHERE active = 1 ORDER BY username"
+                    )
+                ]
+            self.send_json(rows); return
         if clean_path == "/api/product-catalog":
             self.send_json({"pork": list(ORDER_PRODUCTS)}); return
         if clean_path == "/api/orders/summary":
@@ -724,6 +740,30 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Set-Cookie", "processing_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 self.send_header("Content-Length", "2")
                 self.end_headers(); self.wfile.write(b"{}"); return
+            if self.path == "/api/users/change-password":
+                user = self.require_user()
+                if not user: return
+                if user.get("role") != "admin":
+                    self.send_json({"message": "ไม่มีสิทธิ์เข้าถึง"}, 403); return
+                username = str(data.get("username", "")).strip()
+                new_password = str(data.get("new_password", ""))
+                confirm_password = str(data.get("confirm_password", ""))
+                if not username:
+                    self.send_json({"message": "กรุณาระบุบัญชีผู้ใช้"}, 400); return
+                if not new_password or new_password != confirm_password:
+                    self.send_json({"message": "รหัสผ่านใหม่และยืนยันรหัสผ่านไม่ตรงกัน"}, 400); return
+                with db() as conn:
+                    exists = conn.execute(
+                        "SELECT id FROM users WHERE username=? AND active=1",
+                        (username,)
+                    ).fetchone()
+                    if not exists:
+                        self.send_json({"message": "ไม่พบผู้ใช้นี้"}, 404); return
+                    conn.execute(
+                        "UPDATE users SET password_hash=? WHERE username=?",
+                        (hash_password(new_password), username)
+                    )
+                self.send_json({"message": "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว"}); return
             user = self.require_user()
             if not user: return
             if self.path == "/api/read-label":
