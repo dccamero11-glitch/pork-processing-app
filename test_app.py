@@ -7,6 +7,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -304,23 +305,315 @@ class LabelReadingTests(unittest.TestCase):
                 self.assertEqual(profile["branch"], "ตรัง")
                 self.assertEqual(raised.exception.code, 403)
 
+    def test_order_validation_rejects_negative_and_unknown_products(self):
+        with self.assertRaisesRegex(ValueError, "ต้องไม่ติดลบ"):
+            app.prepare_order_items({"items": [{"product_name": "เนื้อแดง", "quantity": -1, "unit": "กก."}]})
+        with self.assertRaisesRegex(ValueError, "ชื่อสินค้าที่ไม่ถูกต้อง"):
+            app.prepare_order_items({"items": [{"product_name": "สินค้าอื่น", "quantity": 1, "unit": "กก."}]})
 
-    def test_order_catalog_has_80_pork_and_24_chicken_products(self):
-        self.assertEqual(len(app.ORDER_PRODUCTS),80);self.assertEqual(len(set(app.ORDER_PRODUCTS)),80)
-        self.assertEqual(len(app.CHICKEN_PRODUCTS),24);self.assertEqual(len(set(app.CHICKEN_PRODUCTS)),24)
-        self.assertEqual(app.CHICKEN_PRODUCTS[-1],"ไก่สับ")
+    def test_order_endpoints_save_server_total_and_load_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "orders.db"):
+                app.init_db()
+                server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                    payload = {
+                        "request_id": "order-endpoint-test-1",
+                        "branch": "บางบัวทอง",
+                        "note": "ขาหน้าขอน้ำหนักขาละ 1.70-1.90 กก.",
+                        "total_weight": 99999,
+                        "items": [
+                            {"product_name": "เนื้อแดง", "quantity": 100, "unit": "กก."},
+                            {"product_name": "สามชั้น", "quantity": 500, "unit": "กก."},
+                            {"product_name": "ขาหน้า", "quantity": 100, "unit": "กก."},
+                            {"product_name": "คากิ", "quantity": 0, "unit": "กก."},
+                        ],
+                    }
+                    request = urllib.request.Request(
+                        base_url + "/api/orders",
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        saved = json.load(response)
+                    query = urllib.parse.urlencode({"branch": "บางบัวทอง", "date": app.date.today().isoformat()})
+                    with urllib.request.urlopen(base_url + "/api/orders?" + query, timeout=3) as response:
+                        history = json.load(response)
+                    with urllib.request.urlopen(base_url + f"/api/orders/{saved['id']}", timeout=3) as response:
+                        detail = json.load(response)
+                    with urllib.request.urlopen(base_url + "/order.html", timeout=3) as response:
+                        order_page = response.read().decode("utf-8")
+                    with urllib.request.urlopen(base_url + "/order-history.html", timeout=3) as response:
+                        history_page = response.read().decode("utf-8")
+                finally:
+                    server.shutdown(); server.server_close(); thread.join(timeout=2)
+                self.assertEqual(saved["saved"], 3)
+                self.assertTrue(saved["success"])
+                self.assertEqual(saved["order_id"], saved["id"])
+                self.assertEqual(saved["total_weight"], 700)
+                self.assertEqual(history[0]["item_count"], 3)
+                self.assertEqual(history[0]["ordered_by"], "test-admin")
+                self.assertEqual(detail["total_weight"], 700)
+                self.assertEqual([item["product_name"] for item in detail["items"]], ["เนื้อแดง", "สามชั้น", "ขาหน้า"])
+                self.assertIn('id="orderRows"', order_page)
+                self.assertIn('id="orderHistoryRows"', history_page)
 
-    def test_local_order_page_save_history_and_summary_support_both_categories(self):
-        with tempfile.TemporaryDirectory() as temp_dir,mock.patch.object(app,"DB",Path(temp_dir)/"orders.db"):
+    def test_manager_cannot_save_or_read_other_branch_orders(self):
+        manager = {"username": "manager_trang", "role": "manager", "branch": "ตรัง"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "DB", Path(temp_dir) / "manager-orders.db"):
+                app.init_db()
+                with mock.patch.object(app.Handler, "current_user", return_value=manager):
+                    server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                        payload = {"request_id": "manager-forbidden-1", "branch": "บางบัวทอง", "items": [{"product_name": "เนื้อแดง", "quantity": 1, "unit": "กก."}]}
+                        request = urllib.request.Request(base_url + "/api/orders", data=json.dumps(payload, ensure_ascii=False).encode(), headers={"Content-Type": "application/json"})
+                        with self.assertRaises(urllib.error.HTTPError) as save_error:
+                            urllib.request.urlopen(request, timeout=3)
+                        with self.assertRaises(urllib.error.HTTPError) as read_error:
+                            urllib.request.urlopen(base_url + "/api/orders?branch=" + urllib.parse.quote("บางบัวทอง"), timeout=3)
+                    finally:
+                        server.shutdown(); server.server_close(); thread.join(timeout=2)
+                self.assertEqual(save_error.exception.code, 403)
+                self.assertEqual(read_error.exception.code, 403)
+
+    def test_selling_price_calculation_and_validation(self):
+        values = app.calculate_selling_price({"product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100,"transport_cost":5,"profit_percent":15,"calculated_price":1})
+        self.assertEqual(float(values[4]), 105)
+        self.assertEqual(float(values[7]), 120.75)
+        self.assertEqual(float(values[8]), 121)
+        values = app.calculate_selling_price({"product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100,"transport_cost":0,"profit_percent":10})
+        self.assertEqual(float(values[7]), 110)
+        for key in ("purchase_cost","transport_cost","profit_percent"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                app.calculate_selling_price({"product_category":"หมู","product_name":"เนื้อแดง",key:-1})
+
+    def test_selling_price_api_history_and_bulk_rollback(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"selling.db"):
             app.init_db();server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
             try:
-                base=f"http://127.0.0.1:{server.server_address[1]}";payload={"request_id":"local-pork-chicken","branch":"บางบัวทอง","items":[{"product_category":"หมู","product_name":"เนื้อแดง","quantity":100,"unit":"กก."},{"product_category":"ไก่","product_name":"อกไก่","quantity":50,"unit":"กก."}]};request=urllib.request.Request(base+"/api/orders",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
-                with urllib.request.urlopen(request,timeout=3) as response:saved=json.load(response)
-                with urllib.request.urlopen(base+"/api/orders?branch=ALL",timeout=3) as response:history=json.load(response)
-                with urllib.request.urlopen(base+"/api/orders/summary?date="+app.date.today().isoformat()+"&branch=ALL",timeout=3) as response:summary=json.load(response)
-                with urllib.request.urlopen(base+"/order.html",timeout=3) as response:page=response.read().decode("utf-8")
-            finally:server.shutdown();server.server_close();thread.join(timeout=2)
-            self.assertEqual(saved["saved"],2);self.assertEqual(saved["total_weight"],150);self.assertEqual(history[0]["item_count"],2);self.assertEqual({row["product_category"] for row in summary},{"หมู","ไก่"});self.assertIn('data-order-category="หมู"',page);self.assertIn('data-order-category="ไก่"',page)
+                base=f"http://127.0.0.1:{server.server_address[1]}";payload={"branch":"บางบัวทอง","product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100,"transport_cost":5,"profit_percent":15,"calculated_price":1,"recommended_price":1}
+                req=urllib.request.Request(base+"/api/selling-prices",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                with urllib.request.urlopen(req,timeout=3) as response: self.assertEqual(json.load(response)["saved"],1)
+                q=urllib.parse.urlencode({"branch":"บางบัวทอง","category":"หมู"})
+                with urllib.request.urlopen(base+"/api/selling-prices?"+q,timeout=3) as response: current=json.load(response)
+                with urllib.request.urlopen(base+"/api/selling-price-history?"+q,timeout=3) as response: history=json.load(response)
+                self.assertEqual(current[0]["calculated_price"],120.75);self.assertEqual(current[0]["recommended_price"],121);self.assertEqual(len(history),1)
+                bulk={"branch":"บางบัวทอง","items":[{"product_category":"หมู","product_name":"สามชั้น","purchase_cost":10},{"product_category":"หมู","product_name":"ผิด","purchase_cost":10}]}
+                req=urllib.request.Request(base+"/api/selling-prices/bulk",data=json.dumps(bulk,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                with self.assertRaises(urllib.error.HTTPError): urllib.request.urlopen(req,timeout=3)
+                with app.db() as conn: self.assertEqual(conn.execute("SELECT COUNT(*) n FROM selling_prices WHERE product_name=?",("สามชั้น",)).fetchone()["n"],0)
+            finally: server.shutdown();server.server_close();thread.join(timeout=2)
+
+    def test_manager_cannot_bypass_selling_price_branch(self):
+        manager={"username":"manager_trang","role":"manager","branch":"ตรัง"}
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"selling-manager.db"):
+            app.init_db()
+            with mock.patch.object(app.Handler,"current_user",return_value=manager):
+                server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+                try:
+                    base=f"http://127.0.0.1:{server.server_address[1]}";payload={"branch":"บางบัวทอง","product_category":"หมู","product_name":"เนื้อแดง","purchase_cost":100}
+                    req=urllib.request.Request(base+"/api/selling-prices",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                    with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(req,timeout=3)
+                    self.assertEqual(error.exception.code,403)
+                finally: server.shutdown();server.server_close();thread.join(timeout=2)
+
+
+    def test_expanded_order_products_are_unique_and_accepted(self):
+        names = ("สะโพกติดหนัง", "หมูบดA", "หมูหมักหมาล่า", "กระดูกอ่อน(โครงแก้ว)")
+        self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
+        rows = app.prepare_order_items({"items": [
+            {"product_name": name, "quantity": index + 1, "unit": "กก."}
+            for index, name in enumerate(names)
+        ]})
+        self.assertEqual([row[0] for row in rows], list(names))
+        self.assertEqual(sum(row[1] for row in rows), 10)
+
+
+    def test_full_chicken_selling_products_are_unique_and_calculable(self):
+        chicken = app.SELLING_PRODUCTS["ไก่"]
+        required = ("ไก่เนื้อล้วง(ตัว)","ไก่กลม(ตัว)","น่อง+สะโพกไก่","เศษไก่ BL","เศษหนังBL","เศษไก่ BLK","ขายำ(เล็บมือนาง)","กระดูกอ่อนไก่","เครื่องในผ่ารวม","ตับติดใจ","ไก่สับ")
+        self.assertEqual(len(chicken), 24)
+        self.assertEqual(len(chicken), len(set(chicken)))
+        for product in required:
+            values = app.calculate_selling_price({"product_category":"ไก่","product_name":product,"purchase_cost":100,"transport_cost":5,"profit_percent":15})
+            self.assertEqual(float(values[7]), 120.75)
+            self.assertEqual(float(values[8]), 121)
+        self.assertTrue(set(app.SELLING_PRODUCTS["หมู"]).isdisjoint({"ไก่เนื้อล้วง(ตัว)","ไก่กลม(ตัว)"}))
+
+
+    def test_additional_pork_order_products_are_unique_and_accepted(self):
+        products = ("ม้าม", "ขั้วปอด", "คางหมู", "สามชั้นหนา", "ชายสามชั้น")
+        self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
+        rows = app.prepare_order_items({"items": [
+            {"product_name": name, "quantity": 1, "unit": "กก."} for name in products
+        ]})
+        self.assertEqual([row[0] for row in rows], list(products))
+        self.assertEqual(sum(row[1] for row in rows), 5)
+
+
+    def test_pork_processing_products_are_distinct_and_summarizable(self):
+        products = app.PORK_PROCESSING_PRODUCTS
+        expected = ("แคปสะโพก", "หนังสัน", "มันแข็ง", "ปีกบน", "ปีกกลาง", "ปีกปลาย", "ปลายปีก", "เศษเนื้อ", "ชายหมูสามชั้น")
+        self.assertEqual(products, expected)
+        self.assertEqual(len(products), 9)
+        self.assertEqual(len(products), len(set(products)))
+        self.assertTrue(set(products).issubset(app.CATEGORIES))
+        self.assertNotIn("หมูแปรรูป", app.CATEGORIES)
+        self.assertEqual(len(app.CATEGORIES), len(set(app.CATEGORIES)))
+        app_js = (app.ROOT / "app.js").read_text(encoding="utf-8")
+        ui_categories = json.loads(app_js.split("CATEGORIES=", 1)[1].split("], PORK_PROCESSING_PRODUCTS", 1)[0] + "]")
+        self.assertTrue(set(products).issubset(ui_categories))
+        self.assertNotIn("หมูแปรรูป", ui_categories)
+        self.assertEqual(len(ui_categories), len(set(ui_categories)))
+        self.assertIn("ปีกปลาย", products)
+        self.assertIn("ปลายปีก", products)
+        self.assertNotEqual(products.index("ปีกปลาย"), products.index("ปลายปีก"))
+        rows = app.prepare_record_rows({
+            "date": app.date.today().isoformat(), "branch": "บางบัวทอง", "category": "แคปสะโพก",
+            "items": [
+                {"valid": True, "name": "แคปสะโพก", "weight": 20, "image": ""},
+                {"valid": True, "name": "หนังสัน", "weight": 10, "image": ""},
+                {"valid": True, "name": "เศษเนื้อ", "weight": 15, "image": ""},
+                {"valid": True, "name": "ชายหมูสามชั้น", "weight": 5, "image": ""},
+            ],
+        })
+        self.assertEqual(sum(row[4] for row in rows), 50)
+
+
+    def test_selling_pork_catalog_uses_ordering_names_only(self):
+        self.assertIs(app.SELLING_PRODUCTS["หมู"], app.ORDER_PRODUCTS)
+        self.assertEqual(len(app.ORDER_PRODUCTS), 80)
+        self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
+        for name in ("เนื้อแดง", "สะโพก", "สามชั้น", "สามชั้นบาง"):
+            self.assertIn(name, app.SELLING_PRODUCTS["หมู"])
+        self.assertEqual(len(app.SELLING_PRODUCTS["ไก่"]), 24)
+        self.assertNotIn("ไก่เนื้อล้วง(ตัว)", app.SELLING_PRODUCTS["หมู"])
+        self.assertNotIn("เนื้อแดง", app.SELLING_PRODUCTS["ไก่"])
+
+
+    def test_order_summary_aggregates_branches_multiple_orders_and_notes(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app, "DB", Path(temp_dir) / "summary.db"):
+            app.init_db(); today = "2026-08-27"; now = "2026-08-27T08:00:00"
+            with app.db() as conn:
+                entries = [("บางบัวทอง","เนื้อแดง",100,"หมายเหตุบางบัวทอง"),("บางบัวทอง","เนื้อแดง",50,""),("หลังสวน","เนื้อแดง",100,"หมายเหตุหลังสวน"),("ตรัง","เนื้อแดง",100,"")]
+                for branch, product, quantity, note in entries:
+                    order_id = conn.execute("INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",(today,branch,"test-admin",quantity,note,now)).fetchone()["id"]
+                    conn.execute("INSERT INTO order_items(order_id,product_name,quantity,unit,created_at) VALUES(?,?,?,?,?)",(order_id,product,quantity,"กก.",now))
+            server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                url=f"http://127.0.0.1:{server.server_address[1]}/api/orders/summary?date={today}&branch=ALL"
+                with urllib.request.urlopen(url,timeout=3) as response: result=json.load(response)
+            finally: server.shutdown();server.server_close();thread.join(timeout=2)
+            meat=next(row for row in result["products"] if row["product_name"]=="เนื้อแดง")
+            self.assertEqual(meat["บางบัวทอง"],150);self.assertEqual(meat["หลังสวน"],100);self.assertEqual(meat["ตรัง"],100)
+            self.assertEqual(meat["total"],350);self.assertEqual(result["grand_total"],350)
+            self.assertEqual(result["notes"]["บางบัวทอง"],["หมายเหตุบางบัวทอง"])
+
+    def test_xlsx_export_is_real_zip_workbook_with_thai_text(self):
+        content=app.make_xlsx("สรุปการสั่งสินค้า",[["วันที่","2026-08-27"]],[["รายการสินค้า","รวม"],["เนื้อแดง",100.0]])
+        self.assertTrue(content.startswith(b"PK"))
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            sheet=archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn("สรุปการสั่งสินค้า",sheet);self.assertIn("เนื้อแดง",sheet)
+
+    def test_order_save_three_branches_is_idempotent_and_summary_totals_300(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app, "DB", Path(temp_dir) / "three-branches.db"):
+            app.init_db(); server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler); thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+            try:
+                base=f"http://127.0.0.1:{server.server_address[1]}"
+                saved=[]
+                for index, branch in enumerate(("บางบัวทอง","หลังสวน","ตรัง"),1):
+                    payload={"request_id":f"three-branch-{index}","branch":branch,"items":[{"product_name":"เนื้อแดง","quantity":100,"unit":"กก."}]}
+                    request=urllib.request.Request(base+"/api/orders",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                    with urllib.request.urlopen(request,timeout=3) as response:
+                        self.assertEqual(response.headers.get_content_type(),"application/json"); saved.append(json.load(response))
+                    if index == 1:
+                        with urllib.request.urlopen(request,timeout=3) as response: retried=json.load(response)
+                with urllib.request.urlopen(base+"/api/orders/summary?date="+app.date.today().isoformat()+"&branch=ALL",timeout=3) as response: summary=json.load(response)
+                with app.db() as conn:
+                    order_count=conn.execute("SELECT COUNT(*) count FROM orders").fetchone()["count"]
+                    item_count=conn.execute("SELECT COUNT(*) count FROM order_items").fetchone()["count"]
+            finally: server.shutdown();server.server_close();thread.join(timeout=2)
+            self.assertTrue(all(row["success"] and row["order_id"] for row in saved));self.assertTrue(retried["duplicate"]);self.assertEqual(retried["order_id"],saved[0]["order_id"])
+            self.assertEqual(order_count,3);self.assertEqual(item_count,3)
+            meat=next(row for row in summary["products"] if row["product_name"]=="เนื้อแดง")
+            self.assertEqual([meat[b] for b in ("บางบัวทอง","หลังสวน","ตรัง")],[100,100,100]);self.assertEqual(meat["total"],300)
+
+    def test_order_transaction_error_rolls_back_and_returns_json(self):
+        original_db=app.db
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"rollback.db"):
+            app.init_db()
+            @app.contextmanager
+            def failing_db():
+                with original_db() as connection:
+                    class FailingConnection:
+                        def execute(self,*args,**kwargs): return connection.execute(*args,**kwargs)
+                        def executemany(self,sql,params):
+                            if "INSERT INTO order_items" in sql: raise RuntimeError("forced database failure")
+                            return connection.executemany(sql,params)
+                    yield FailingConnection()
+            with mock.patch.object(app,"db",failing_db):
+                server=app.ExclusiveThreadingHTTPServer(("127.0.0.1",0),app.Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+                try:
+                    payload={"request_id":"rollback-1","branch":"บางบัวทอง","items":[{"product_name":"เนื้อแดง","quantity":100,"unit":"กก."}]}
+                    request=urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/api/orders",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
+                    with self.assertRaises(urllib.error.HTTPError) as raised: urllib.request.urlopen(request,timeout=3)
+                    error=json.load(raised.exception)
+                finally: server.shutdown();server.server_close();thread.join(timeout=2)
+            with original_db() as conn: count=conn.execute("SELECT COUNT(*) count FROM orders").fetchone()["count"]
+            self.assertEqual(raised.exception.code,500);self.assertFalse(error["success"]);self.assertNotIn("forced database failure",json.dumps(error));self.assertEqual(count,0)
+
+    def test_existing_order_schema_gets_safe_idempotency_migration(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app,"DB",Path(temp_dir)/"existing.db"):
+            raw=app.sqlite3.connect(app.DB)
+            raw.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY AUTOINCREMENT,order_date DATE NOT NULL,branch TEXT NOT NULL,ordered_by TEXT NOT NULL,total_weight NUMERIC NOT NULL,note TEXT NOT NULL DEFAULT '',created_at TIMESTAMP NOT NULL)")
+            raw.execute("CREATE TABLE order_items(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL REFERENCES orders(id),product_name TEXT NOT NULL,quantity NUMERIC NOT NULL,unit TEXT NOT NULL,created_at TIMESTAMP NOT NULL)")
+            raw.commit();raw.close()
+            app.init_db();app.init_db()
+            with app.db() as conn:
+                columns={row["name"] for row in conn.execute("PRAGMA table_info(order_requests)")}
+                indexes={row["name"] for row in conn.execute("PRAGMA index_list(order_requests)")}
+            self.assertEqual(columns,{"request_id","order_id","created_at"})
+            self.assertIn("idx_order_requests_request_id",indexes);self.assertIn("idx_order_requests_order_id",indexes)
+
+    def test_postgres_order_sql_uses_psycopg_placeholders(self):
+        statements=(
+            "SELECT order_id FROM order_requests WHERE request_id=?",
+            "INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
+            "INSERT INTO order_items(order_id,product_name,quantity,unit,created_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO order_requests(request_id,order_id,created_at) VALUES(?,?,?)",
+        )
+        for statement in statements:
+            translated=app.postgres_sql(statement)
+            self.assertNotIn("?",translated);self.assertEqual(translated.count("%s"),statement.count("?"))
+
+    def test_postgres_wrapper_uses_cursor_executemany_not_connection(self):
+        calls=[]
+        class FakeCursor:
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+            def executemany(self,sql,params): calls.append((sql,list(params)))
+        class FakePostgresConnection:
+            def cursor(self): return FakeCursor()
+            def execute(self,sql,params=()): calls.append((sql,params));return FakeCursor()
+            def commit(self): calls.append(("commit",None))
+            def rollback(self): calls.append(("rollback",None))
+            def close(self): calls.append(("close",None))
+        fake_psycopg=type("FakePsycopg",(),{"connect":staticmethod(lambda *_args,**_kwargs:FakePostgresConnection())})
+        fake_rows=type("FakeRows",(),{"dict_row":object()})
+        with mock.patch.object(app,"USE_POSTGRES",True),mock.patch.object(app,"DATABASE_URL","postgresql://test"),mock.patch.dict(app.sys.modules if hasattr(app,"sys") else __import__('sys').modules,{"psycopg":fake_psycopg,"psycopg.rows":fake_rows}):
+            with app.db() as conn:
+                conn.executemany("INSERT INTO order_items(order_id,product_name,quantity,unit,created_at) VALUES(?,?,?,?,?)",[(1,"เนื้อแดง",100,"กก.","2026-08-27")])
+        insert=next(row for row in calls if isinstance(row[0],str) and row[0].startswith("INSERT INTO order_items"))
+        self.assertNotIn("?",insert[0]);self.assertEqual(insert[0].count("%s"),5);self.assertIn(("commit",None),calls)
+
 
 if __name__ == "__main__":
     unittest.main()
