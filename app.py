@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import base64
@@ -1030,7 +1030,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             if self.path == "/api/orders":
 
-                allowed_order_products = allowed_order_products
+                allowed_order_products = set(ORDER_PRODUCTS)
                 chicken_products = globals().get("CHICKEN_PRODUCTS", ())
                 if not chicken_products:
                     selling_products = globals().get("SELLING_PRODUCTS", {})
@@ -1168,3 +1168,4 @@ if __name__ == "__main__":
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: server.server_close()
+
