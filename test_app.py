@@ -223,40 +223,8 @@ class LabelReadingTests(unittest.TestCase):
                 self.assertEqual(summary[0]["product_name"], "หมูสามชั้นบาง")
                 self.assertAlmostEqual(summary[0]["weight_kg"], 2.39)
 
-    def test_read_only_roles_are_blocked_from_write_endpoints(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with mock.patch.dict(os.environ, {"APP_TESTING": ""}, clear=False):
-                with mock.patch.object(app, "DB", Path(temp_dir) / "readonly.db"):
-                    app.init_db()
-                    server = app.ExclusiveThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
-                    thread = threading.Thread(target=server.serve_forever, daemon=True)
-                    thread.start()
-                    try:
-                        base_url = f"http://127.0.0.1:{server.server_address[1]}"
-                        payload = {
-                            "date": app.date.today().isoformat(),
-                            "branch": "บางบัวทอง",
-                            "category": "หมูบด A",
-                            "items": [{"valid": True, "name": "เนื้อแดง", "weight": 1.0, "image": "data:image/png;base64,AA=="}],
-                        }
-                        for username, role in (("acct1", "accounting"), ("audit", "audit")):
-                            with self.subTest(username=username, role=role):
-                                token = app.create_session({"username": username, "role": role, "branch": None, "exp": int(time.time()) + 3600})
-                                request = urllib.request.Request(
-                                    base_url + "/api/records",
-                                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                    headers={"Content-Type": "application/json", "Cookie": f"processing_session={token}"},
-                                )
-                                with self.assertRaises(urllib.error.HTTPError) as raised:
-                                    urllib.request.urlopen(request, timeout=3)
-                                self.assertEqual(raised.exception.code, 403)
-                                self.assertIn("อ่านอย่างเดียว", json.loads(raised.exception.read())["message"])
-                    finally:
-                        server.shutdown()
-                        server.server_close()
-                        thread.join(timeout=2)
-
     def test_admin_can_manage_passwords_and_other_roles_are_forbidden(self):
+        os.environ.pop("APP_TESTING", None)
         with tempfile.TemporaryDirectory() as temp_dir:
             with mock.patch.object(app, "DB", Path(temp_dir) / "user-management.db"):
                 app.init_db()
@@ -271,12 +239,12 @@ class LabelReadingTests(unittest.TestCase):
                         headers={"Cookie": f"processing_session={admin_token}"},
                     ), timeout=3) as response:
                         users = json.load(response)
-                    self.assertIn("acct1", {user["username"] for user in users})
+                    self.assertIn("manager_bangbuathong", {user["username"] for user in users})
                     self.assertNotIn("password_hash", users[0])
 
                     request = urllib.request.Request(
                         base_url + "/api/users/change-password",
-                        data=json.dumps({"username": "acct1", "new_password": "newpass123", "confirm_password": "newpass123"}, ensure_ascii=False).encode("utf-8"),
+                        data=json.dumps({"username": "manager_bangbuathong", "new_password": "newpass123", "confirm_password": "newpass123"}, ensure_ascii=False).encode("utf-8"),
                         headers={"Content-Type": "application/json", "Cookie": f"processing_session={admin_token}"},
                     )
                     with urllib.request.urlopen(request, timeout=3) as response:
@@ -286,7 +254,7 @@ class LabelReadingTests(unittest.TestCase):
                     manager_token = app.create_session({"username": "manager_trang", "role": "manager", "branch": "ตรัง", "exp": int(time.time()) + 3600})
                     forbidden = urllib.request.Request(
                         base_url + "/api/users/change-password",
-                        data=json.dumps({"username": "audit", "new_password": "x", "confirm_password": "x"}, ensure_ascii=False).encode("utf-8"),
+                        data=json.dumps({"username": "manager_bangbuathong", "new_password": "x", "confirm_password": "x"}, ensure_ascii=False).encode("utf-8"),
                         headers={"Content-Type": "application/json", "Cookie": f"processing_session={manager_token}"},
                     )
                     with self.assertRaises(urllib.error.HTTPError) as raised:
@@ -298,6 +266,7 @@ class LabelReadingTests(unittest.TestCase):
                     thread.join(timeout=2)
 
     def test_admin_users_endpoint_lists_real_database_users(self):
+        os.environ.pop("APP_TESTING", None)
         with tempfile.TemporaryDirectory() as temp_dir:
             with mock.patch.object(app, "DB", Path(temp_dir) / "users-list.db"):
                 app.init_db()
@@ -317,8 +286,6 @@ class LabelReadingTests(unittest.TestCase):
                     self.assertIn("manager_bangbuathong", usernames)
                     self.assertIn("manager_trang", usernames)
                     self.assertIn("manager_langsuan", usernames)
-                    self.assertIn("acct1", usernames)
-                    self.assertIn("audit", usernames)
                     self.assertNotIn("password_hash", users[0])
                 finally:
                     server.shutdown()

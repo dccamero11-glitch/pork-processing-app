@@ -27,30 +27,13 @@ DB = ROOT / "processing.db"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8088"))
+PORT = int(os.environ.get("PORT", "10000"))
 APP_ENV = os.environ.get("APP_ENV", "development").lower()
-AUTH_SECRET = os.environ.get("AUTH_SECRET", "").strip() or secrets.token_hex(32)
+AUTH_SECRET = os.environ.get("AUTH_SECRET", "local-development-secret-change-before-production")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("pork-processing-app")
 BRANCH_ORDER = ("บางบัวทอง", "หลังสวน", "ตรัง")
 BRANCHES = set(BRANCH_ORDER)
-READ_ONLY_ROLES = {"accounting", "audit"}
-WRITE_PROTECTED_PATHS = {
-    "/api/records",
-    "/api/receipts",
-    "/api/orders",
-    "/api/selling-prices",
-    "/api/selling-prices/bulk",
-    "/api/competitor-prices",
-}
-MANAGED_USERNAMES = (
-    "admin",
-    "manager_bangbuathong",
-    "manager_trang",
-    "manager_langsuan",
-    "acct1",
-    "audit",
-)
 CATEGORIES = {
     "หมูบด A", "หมูบด B", "หมูบด 5", "หมูบดผสมไก่", "หมูอ้วนหมูบด(หมูบด6)",
     "ขาหน้าล้วน", "ขาหลังล้วน", "ขาหลังเลาะ", "คากิ", "คาตั้งกลม", "เครื่องในต้ม",
@@ -242,24 +225,20 @@ def verify_password(password, encoded):
 def seed_users():
     accounts = [
         ("admin", "ADMIN_PASSWORD", "admin123", "admin", None),
-        ("manager_bangbuathong", "MANAGER_BANGBUATHONG_PASSWORD", "123456", "manager", "บางบัวทอง"),
-        ("manager_trang", "MANAGER_TRANG_PASSWORD", "123456", "manager", "ตรัง"),
-        ("manager_langsuan", "MANAGER_LANGSUAN_PASSWORD", "123456", "manager", "หลังสวน"),
-        ("acct1", "ACCOUNTING_PASSWORD", "123456", "accounting", None),
-        ("audit", "AUDIT_PASSWORD", "123456", "audit", None),
+        ("manager_bangbuathong", "MANAGER_BANGBUATHONG_PASSWORD", "manager123", "manager", "บางบัวทอง"),
+        ("manager_trang", "MANAGER_TRANG_PASSWORD", "manager123", "manager", "ตรัง"),
+        ("manager_langsuan", "MANAGER_LANGSUAN_PASSWORD", "manager123", "manager", "หลังสวน"),
     ]
     with db() as conn:
         for username, env_name, default_password, role, branch in accounts:
-            password = (os.environ.get(env_name) or default_password or "").strip()
-            if not password:
-                password = default_password
+            password = os.environ.get(env_name, default_password)
             exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
             if not exists:
                 conn.execute(
                     "INSERT INTO users(username,password_hash,role,branch,active,created_at) VALUES(?,?,?,?,?,?)",
                     (username, hash_password(password), role, branch, 1, datetime.now().isoformat(timespec="seconds")),
                 )
-            elif os.environ.get(env_name) or default_password:
+            elif os.environ.get(env_name):
                 conn.execute("UPDATE users SET password_hash=?,role=?,branch=?,active=1 WHERE username=?",
                              (hash_password(password), role, branch, username))
 
@@ -283,30 +262,18 @@ def parse_session(token):
 
 
 def effective_branch(user, requested, allow_all=False):
-    requested = (requested or "").strip()
-    role = user.get("role")
-    if role in {"admin", "accounting", "audit"}:
-        if requested in ("", None):
-            return "ALL" if allow_all else "ALL"
-        if requested == "ALL":
-            return "ALL"
-        if requested in BRANCHES:
-            return requested
-        return "ALL" if allow_all else "ALL"
-    if role == "manager":
-        if requested in (None, ""):
-            return user.get("branch") or ""
-        if requested == user.get("branch"):
-            return user["branch"]
-        raise PermissionError("ไม่มีสิทธิ์เข้าถึงสาขานี้")
+    if user["role"] == "admin":
+        if requested == "ALL" and allow_all: return requested
+        if requested in BRANCHES: return requested
+    elif requested in (user["branch"], "ALL"):
+        return user["branch"]
     raise PermissionError("ไม่มีสิทธิ์เข้าถึงสาขานี้")
 
 
 def validate_production_config():
     if APP_ENV != "production": return
     required = ["DATABASE_URL", "AUTH_SECRET", "OPENAI_API_KEY", "ADMIN_PASSWORD",
-                "MANAGER_BANGBUATHONG_PASSWORD", "MANAGER_TRANG_PASSWORD", "MANAGER_LANGSUAN_PASSWORD",
-                "ACCOUNTING_PASSWORD", "AUDIT_PASSWORD"]
+                "MANAGER_BANGBUATHONG_PASSWORD", "MANAGER_TRANG_PASSWORD", "MANAGER_LANGSUAN_PASSWORD"]
     missing = [name for name in required if not os.environ.get(name, "").strip()]
     if missing:
         raise RuntimeError("Production configuration missing: " + ", ".join(missing))
@@ -919,9 +886,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"message": "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว"}); return
             user = self.require_user()
             if not user: return
-            if user.get("role") in READ_ONLY_ROLES and self.path in WRITE_PROTECTED_PATHS:
-                self.send_json({"message": "สิทธิ์ผู้ใช้นี้เป็นแบบอ่านอย่างเดียว ไม่อนุญาตให้บันทึกหรือแก้ไขข้อมูล"}, 403)
-                return
             if self.path == "/api/read-label":
                 image = str(data.get("image", ""))
                 if not image.startswith("data:image/"):
