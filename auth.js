@@ -41,3 +41,51 @@ window.authReady=fetch("/api/me").then(async response=>{if(response.status===401
         ensureReceivingNavigation();
     }
 })();
+
+// STOCK_NAV_RESTORE
+(function () {
+    function ensureStockNavigation() {
+        document.querySelectorAll("nav").forEach(function (nav) {
+
+            if (nav.querySelector('a[href="/stock.html"]')) {
+                return;
+            }
+
+            var link = document.createElement("a");
+            link.href = "/stock.html";
+            link.textContent = "สต๊อก";
+
+            var receivingHistory =
+                nav.querySelector('a[href="/receiving-history.html"]');
+
+            var orderSummary =
+                nav.querySelector('a[href="/order-summary.html"]');
+
+            if (
+                receivingHistory &&
+                receivingHistory.nextSibling
+            ) {
+                nav.insertBefore(
+                    link,
+                    receivingHistory.nextSibling
+                );
+            } else if (orderSummary) {
+                nav.insertBefore(
+                    link,
+                    orderSummary.nextSibling
+                );
+            } else {
+                nav.appendChild(link);
+            }
+        });
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener(
+            "DOMContentLoaded",
+            ensureStockNavigation
+        );
+    } else {
+        ensureStockNavigation();
+    }
+})();
