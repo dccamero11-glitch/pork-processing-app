@@ -62,7 +62,6 @@
     function getActualKey(code) {
         const selectedDate = stockDate.value || todayIso();
         return `${selectedDate}:${branchFilter.value}:${code}`;
-    }:${code}`;
     }
 
     function getActual(code) {
