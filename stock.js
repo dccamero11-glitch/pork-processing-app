@@ -60,7 +60,9 @@
     }
 
     function getActualKey(code) {
-        return `${branchFilter.value}:${code}`;
+        const selectedDate = stockDate.value || todayIso();
+        return `${selectedDate}:${branchFilter.value}:${code}`;
+    }:${code}`;
     }
 
     function getActual(code) {
@@ -503,9 +505,7 @@
             const saved = counts[product.code];
 
             if (saved) {
-                state.actual[
-                    branch + ":" + product.code
-                ] = String(saved.actual);
+                state.actual[getActualKey(product.code)] = String(saved.actual);
             }
         });
 
