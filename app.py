@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import base64
@@ -581,6 +581,79 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json(rows); return
         if clean_path == "/api/product-catalog":
             self.send_json({"pork": list(ORDER_PRODUCTS), "chicken": list(SELLING_PRODUCTS.get("ไก่", ())) }); return
+        if clean_path == "/api/stock":
+            from urllib.parse import urlparse, parse_qs
+
+            q = parse_qs(urlparse(self.path).query)
+            stock_date = q.get("date", [date.today().isoformat()])[0]
+            requested_branch = q.get(
+                "branch",
+                [user.get("branch") or BRANCH_ORDER[0]]
+            )[0]
+
+            try:
+                datetime.strptime(stock_date, "%Y-%m-%d")
+            except ValueError:
+                self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400)
+                return
+
+            try:
+                branch = effective_branch(user, requested_branch)
+            except PermissionError as exc:
+                self.send_json({"message": str(exc)}, 403)
+                return
+
+            with db() as conn:
+
+                receipt_rows = conn.execute(
+                    """SELECT
+                        i.product_name,
+                        COALESCE(SUM(i.weight_kg),0) AS received
+                    FROM receipts r
+                    JOIN receipt_items i ON i.receipt_id=r.id
+                    WHERE r.received_date=? AND r.branch=?
+                    GROUP BY i.product_name""",
+                    (stock_date, branch)
+                ).fetchall()
+
+                count_rows = conn.execute(
+                    """SELECT
+                        product_code,
+                        product_name,
+                        actual_quantity,
+                        system_quantity,
+                        variance,
+                        counted_by,
+                        created_at
+                    FROM stock_counts
+                    WHERE stock_date=? AND branch=?""",
+                    (stock_date, branch)
+                ).fetchall()
+
+            received = {
+                row["product_name"]: float(row["received"] or 0)
+                for row in receipt_rows
+            }
+
+            counts = {
+                str(row["product_code"]): {
+                    "actual": float(row["actual_quantity"] or 0),
+                    "system": float(row["system_quantity"] or 0),
+                    "variance": float(row["variance"] or 0),
+                    "counted_by": row["counted_by"],
+                    "created_at": str(row["created_at"])
+                }
+                for row in count_rows
+            }
+
+            self.send_json({
+                "date": stock_date,
+                "branch": branch,
+                "received_by_product_name": received,
+                "counts": counts
+            })
+            return
+
         if clean_path == "/api/receipts/summary":
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -927,6 +1000,111 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as conn:
                     conn.executemany("INSERT INTO records(tx_date,branch,category,product_name,weight_kg,image_data,created_at) VALUES(?,?,?,?,?,?,?)", valid)
                 self.send_json({"ok": True, "saved": len(valid)}); return
+            if self.path == "/api/stock/count":
+                stock_date = str(
+                    data.get("date", date.today().isoformat())
+                ).strip()
+
+                try:
+                    datetime.strptime(stock_date, "%Y-%m-%d")
+                except ValueError:
+                    raise ValueError("รูปแบบวันที่ไม่ถูกต้อง")
+
+                branch = effective_branch(
+                    user,
+                    data.get("branch")
+                )
+
+                product_code = str(
+                    data.get("product_code", "")
+                ).strip()
+
+                product_name = str(
+                    data.get("product_name", "")
+                ).strip()
+
+                if not product_code:
+                    raise ValueError("ไม่มีรหัสสินค้า")
+
+                if not product_name:
+                    raise ValueError("ไม่มีชื่อสินค้า")
+
+                actual = Decimal(
+                    str(data.get("actual_quantity", "0"))
+                )
+
+                system = Decimal(
+                    str(data.get("system_quantity", "0"))
+                )
+
+                variance = actual - system
+
+                now = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+
+                stored_actual = (
+                    actual if USE_POSTGRES else float(actual)
+                )
+
+                stored_system = (
+                    system if USE_POSTGRES else float(system)
+                )
+
+                stored_variance = (
+                    variance if USE_POSTGRES else float(variance)
+                )
+
+                with db() as conn:
+                    conn.execute(
+                        """INSERT INTO stock_counts(
+                            stock_date,
+                            branch,
+                            product_code,
+                            product_name,
+                            actual_quantity,
+                            system_quantity,
+                            variance,
+                            counted_by,
+                            created_at
+                        )
+                        VALUES(?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(
+                            stock_date,
+                            branch,
+                            product_code
+                        )
+                        DO UPDATE SET
+                            product_name=excluded.product_name,
+                            actual_quantity=excluded.actual_quantity,
+                            system_quantity=excluded.system_quantity,
+                            variance=excluded.variance,
+                            counted_by=excluded.counted_by,
+                            created_at=excluded.created_at""",
+                        (
+                            stock_date,
+                            branch,
+                            product_code,
+                            product_name,
+                            stored_actual,
+                            stored_system,
+                            stored_variance,
+                            user["username"],
+                            now
+                        )
+                    )
+
+                self.send_json({
+                    "ok": True,
+                    "date": stock_date,
+                    "branch": branch,
+                    "product_code": product_code,
+                    "actual_quantity": float(actual),
+                    "system_quantity": float(system),
+                    "variance": float(variance)
+                })
+                return
+
             if self.path == "/api/receipts":
                 branch = effective_branch(user, data.get("branch"))
                 received_date = str(data.get("received_date", "")).strip()
