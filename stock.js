@@ -1,6 +1,24 @@
 (() => {
     "use strict";
 
+    // Remove shared Export Excel / Print bar on Stock page.
+    function removeSharedReportActions() {
+        document.querySelectorAll(".report-actions").forEach(function (element) {
+            element.remove();
+        });
+    }
+
+    removeSharedReportActions();
+
+    const reportActionsObserver = new MutationObserver(function () {
+        removeSharedReportActions();
+    });
+
+    reportActionsObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+
     const state = {
         products: [],
         filtered: [],
