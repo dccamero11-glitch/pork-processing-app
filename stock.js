@@ -13,6 +13,8 @@
     const searchInput = $("searchInput");
     const categoryFilter = $("categoryFilter");
     const branchFilter = $("branchFilter");
+    const stockDate = $("stockDate");
+    stockDate.value = todayIso();
 
     function text(value) {
         return value == null ? "" : String(value);
@@ -230,28 +232,68 @@
             `แสดง ${rows.length.toLocaleString("th-TH")} จาก ${state.products.length.toLocaleString("th-TH")} รายการ`;
     }
 
-    body.addEventListener("input", event => {
+    body.addEventListener("change", async event => {
         const input = event.target.closest(".actual-input");
 
         if (!input) {
             return;
         }
 
-        const key = getActualKey(input.dataset.code);
+        const product = state.products.find(
+            item => item.code === input.dataset.code
+        );
+
+        if (!product) {
+            return;
+        }
+
+        const key = getActualKey(product.code);
 
         if (input.value === "") {
             delete state.actual[key];
-        } else {
-            state.actual[key] = input.value;
+            saveActual();
+            render();
+            return;
         }
 
+        state.actual[key] = input.value;
         saveActual();
         render();
+
+        input.disabled = true;
+
+        try {
+            await saveCount(
+                product,
+                input.value
+            );
+        } catch (error) {
+            console.error(error);
+            alert(error.message);
+        } finally {
+            input.disabled = false;
+        }
     });
 
     searchInput.addEventListener("input", applyFilters);
     categoryFilter.addEventListener("change", applyFilters);
-    branchFilter.addEventListener("change", render);
+    stockDate.addEventListener("change", async () => {
+        try {
+            await loadStockBackend();
+        } catch (error) {
+            console.error(error);
+        }
+        render();
+    });
+
+    branchFilter.addEventListener("change", async () => {
+        try {
+            await loadStockBackend();
+        } catch (error) {
+            console.error(error);
+        }
+        render();
+    });
 
     $("printBtn").addEventListener("click", () => {
         window.print();
@@ -335,6 +377,149 @@
         event.target.value = "";
     });
 
+    function todayIso() {
+        const d = new Date();
+        const offset = d.getTimezoneOffset();
+        return new Date(
+            d.getTime() - offset * 60000
+        ).toISOString().slice(0, 10);
+    }
+
+    async function loadPosStockData() {
+        const response = await fetch(
+            "/stock_pos_import.json?ts=" + Date.now(),
+            { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+            throw new Error("ไม่พบข้อมูลนำเข้าจาก POS");
+        }
+
+        const data = await response.json();
+
+        const byCode = new Map();
+
+        (data.products || []).forEach(item => {
+            byCode.set(String(item.code), item);
+        });
+
+        state.products.forEach(product => {
+            const pos = byCode.get(String(product.code));
+
+            if (!pos) {
+                return;
+            }
+
+            product.opening =
+                Number(pos.opening || 0);
+
+            product.processed =
+                Number(pos.processed || 0);
+
+            product.sold =
+                (stockDate.value || todayIso()) === String(data.report_date || "")
+                    ? Number(pos.sold || 0)
+                    : 0;
+
+            product.posReceived =
+                Number(pos.pos_received || 0);
+
+            product.posClosing =
+                Number(pos.pos_closing || 0);
+        });
+
+        state.posImport = data;
+    }
+
+    const RECEIVING_NAME_ALIASES = {
+        "เนื้อแดง": "เนื้อแดง (ไหล่)"
+    };
+
+    function receivingNameForStock(productName) {
+        for (const [receivingName, stockName] of Object.entries(RECEIVING_NAME_ALIASES)) {
+            if (stockName === productName) {
+                return receivingName;
+            }
+        }
+        return productName;
+    }
+
+    async function loadStockBackend() {
+        const branch = branchFilter.value;
+
+        const response = await fetch(
+            "/api/stock?date=" +
+            encodeURIComponent(stockDate.value || todayIso()) +
+            "&branch=" +
+            encodeURIComponent(branch),
+            { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                "โหลดข้อมูล Stock Backend ไม่สำเร็จ"
+            );
+        }
+
+        const data = await response.json();
+
+        const received =
+            data.received_by_product_name || {};
+
+        const counts =
+            data.counts || {};
+
+        state.products.forEach(product => {
+
+            product.received =
+                Number(received[receivingNameForStock(product.name)] || 0);
+
+            const saved = counts[product.code];
+
+            if (saved) {
+                state.actual[
+                    branch + ":" + product.code
+                ] = String(saved.actual);
+            }
+        });
+
+        saveActual();
+    }
+
+    async function saveCount(product, actualValue) {
+
+        const payload = {
+            date: stockDate.value || todayIso(),
+            branch: branchFilter.value,
+            product_code: product.code,
+            product_name: product.name,
+            actual_quantity: Number(actualValue),
+            system_quantity: systemStock(product)
+        };
+
+        const response = await fetch(
+            "/api/stock/count",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(payload)
+            }
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                result.message ||
+                "บันทึกนับจริงไม่สำเร็จ"
+            );
+        }
+
+        return result;
+    }
+
     async function init() {
         loadSavedActual();
 
@@ -366,6 +551,19 @@
             }));
 
             renderCategories();
+
+            try {
+                await loadPosStockData();
+            } catch (posError) {
+                console.error(posError);
+            }
+
+            try {
+                await loadStockBackend();
+            } catch (backendError) {
+                console.error(backendError);
+            }
+
             applyFilters();
 
         } catch (error) {

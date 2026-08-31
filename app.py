@@ -188,6 +188,22 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_receipts_date_branch ON receipts(received_date,branch)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt_id ON receipt_items(receipt_id)")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS stock_counts(
+            id {id_column},
+            stock_date DATE NOT NULL,
+            branch TEXT NOT NULL,
+            product_code TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            actual_quantity NUMERIC NOT NULL DEFAULT 0,
+            system_quantity NUMERIC NOT NULL DEFAULT 0,
+            variance NUMERIC NOT NULL DEFAULT 0,
+            counted_by TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            UNIQUE(stock_date,branch,product_code)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_counts_date_branch ON stock_counts(stock_date,branch)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_counts_product ON stock_counts(product_code)")
+
         conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_prices(
             id {id_column}, product_category TEXT NOT NULL, product_name TEXT NOT NULL,
             purchase_cost NUMERIC(12,2) NOT NULL DEFAULT 0, transport_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -203,6 +219,7 @@ def init_db():
             calculated_price NUMERIC(12,2), recommended_price NUMERIC(12,2), branch TEXT,
             changed_by TEXT, created_at TIMESTAMP NOT NULL
         )""")
+    ensure_order_item_columns()
     seed_users()
 
 
