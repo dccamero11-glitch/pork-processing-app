@@ -484,10 +484,18 @@
         const received =
             data.received_by_product_name || {};
 
+        const opening =
+
+            data.opening_by_product_code || {};
+
+
         const counts =
             data.counts || {};
 
         state.products.forEach(product => {
+
+            product.opening =
+                Number(opening[product.code] || 0);
 
             product.received =
                 Number(received[receivingNameForStock(product.name)] || 0);

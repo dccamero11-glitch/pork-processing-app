@@ -629,6 +629,21 @@ class Handler(SimpleHTTPRequestHandler):
                     (stock_date, branch)
                 ).fetchall()
 
+                opening_rows = conn.execute(
+                    """SELECT sc.product_code, sc.actual_quantity
+                    FROM stock_counts sc
+                    INNER JOIN (
+                        SELECT product_code, MAX(stock_date) AS latest_date
+                        FROM stock_counts
+                        WHERE branch=? AND stock_date<?
+                        GROUP BY product_code
+                    ) latest
+                      ON latest.product_code=sc.product_code
+                     AND latest.latest_date=sc.stock_date
+                    WHERE sc.branch=?""",
+                    (branch, stock_date, branch)
+                ).fetchall()
+
             received = {
                 row["product_name"]: float(row["received"] or 0)
                 for row in receipt_rows
@@ -645,10 +660,16 @@ class Handler(SimpleHTTPRequestHandler):
                 for row in count_rows
             }
 
+            opening_by_product_code = {
+                str(row["product_code"]): float(row["actual_quantity"] or 0)
+                for row in opening_rows
+            }
+
             self.send_json({
                 "date": stock_date,
                 "branch": branch,
                 "received_by_product_name": received,
+                "opening_by_product_code": opening_by_product_code,
                 "counts": counts
             })
             return
