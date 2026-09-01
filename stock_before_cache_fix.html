@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>สต๊อกคงเหลือ</title>
+    <link rel="stylesheet" href="/stock.css">
+</head>
+
+<body>
+
+<header class="topbar">
+    <div>
+        <div class="brand">Pork Processing</div>
+        <div class="subtitle">ระบบจัดการสต๊อกสินค้า</div>
+    </div>
+
+    <nav>
+        <a href="/">หน้าหลัก</a>
+        <a href="/order.html">สั่งสินค้า</a>
+        <a href="/order-history.html">ประวัติการสั่งสินค้า</a>
+        <a href="/order-summary.html">สรุปการสั่งสินค้า</a>
+        <a href="/receiving.html">รับสินค้าเข้า</a>
+        <a href="/receiving-history.html">ประวัติรับสินค้า</a>
+        <a class="active" href="/stock.html">สต๊อก</a>
+    </nav>
+</header>
+
+<main class="container">
+
+    <section class="page-head">
+        <div>
+            <h1>สต๊อกคงเหลือ</h1>
+            <p>รายการสินค้าอ้างอิงรหัสจาก STOCK.xlsx</p>
+        </div>
+
+        <div class="actions">
+            <button id="importBtn" class="btn primary">นำเข้าไฟล์ POS</button>
+            <button id="exportBtn" class="btn">Export Excel</button>
+            <button id="printBtn" class="btn">Print</button>
+        </div>
+    </section>
+
+    <section class="control-panel">
+
+        <div class="field">
+            <label>สาขา</label>
+            <select id="branchFilter">
+                <option value="บางบัวทอง">บางบัวทอง</option>
+                <option value="หลังสวน">หลังสวน</option>
+                <option value="ตรัง">ตรัง</option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label>วันที่สต๊อก</label>
+            <input id="stockDate" type="date">
+        </div>
+
+        <div class="field">
+            <label>ค้นหาสินค้า</label>
+            <input
+                id="searchInput"
+                type="search"
+                placeholder="ค้นหารหัสสินค้า หรือชื่อสินค้า"
+            >
+        </div>
+
+        <div class="field">
+            <label>หมวดสินค้า</label>
+            <select id="categoryFilter">
+                <option value="">ทั้งหมด</option>
+            </select>
+        </div>
+
+    </section>
+
+    <section class="cards">
+
+        <article class="card">
+            <span>รายการสินค้าทั้งหมด</span>
+            <strong id="totalProducts">0</strong>
+            <small>รายการ</small>
+        </article>
+
+        <article class="card">
+            <span>รายการที่แสดง</span>
+            <strong id="visibleProducts">0</strong>
+            <small>รายการ</small>
+        </article>
+
+        <article class="card">
+            <span>นับจริงแล้ว</span>
+            <strong id="countedProducts">0</strong>
+            <small>รายการ</small>
+        </article>
+
+        <article class="card warning">
+            <span>มีผลต่าง</span>
+            <strong id="varianceProducts">0</strong>
+            <small>รายการ</small>
+        </article>
+
+    </section>
+
+    <section class="table-card">
+
+        <div class="table-title">
+            <div>
+                <h2>รายการสต๊อก</h2>
+                <span id="resultText">กำลังโหลดข้อมูล...</span>
+            </div>
+        </div>
+
+        <div class="table-wrap">
+
+            <table>
+
+                <thead>
+                    <tr>
+                        <th>รหัสสินค้า</th>
+                        <th>ชื่อสินค้า</th>
+                        <th>หมวดสินค้า</th>
+                        <th>หน่วย</th>
+                        <th>ตั้งต้น</th>
+                        <th>แปรรูป</th>
+                        <th>รับสินค้า</th>
+                        <th>ขายจาก POS</th>
+                        <th>คงเหลือตามระบบ</th>
+                        <th>นับจริง</th>
+                        <th>ผลต่าง</th>
+                        <th>สถานะ</th>
+                    </tr>
+                </thead>
+
+                <tbody id="stockBody"></tbody>
+
+            </table>
+
+        </div>
+
+    </section>
+
+</main>
+
+<input id="posFile" type="file" accept=".xlsx,.xls" hidden>
+
+<script src="/auth.js"></script>
+<script src="/stock.js"></script>
+
+</body>
+</html>
