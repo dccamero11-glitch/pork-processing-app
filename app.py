@@ -637,42 +637,52 @@ def parse_pos_xlsx_rows(file_bytes):
         raise ValueError("ไฟล์ POS ไม่ใช่ ZIP/XLSX ที่ถูกต้อง") from exc
 
 
+def normalize_pos_header_text(value):
+    return re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(value).strip()).casefold()
+
+
 def find_pos_report_rows(rows):
     header_indexes = {}
-    for index, row in enumerate(rows[:20]):
-        normalized_row = [re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(value).strip()) for value in row]
-        for col_index, cell in enumerate(normalized_row):
-            cell_norm = cell.casefold()
-            if "รหัสสินค้า" in cell_norm or "รหัส" in cell_norm and "สินค้า" in cell_norm:
-                header_indexes["code"] = col_index
-            if "ชื่อสินค้า" in cell_norm or "ชื่อ" in cell_norm and "สินค้า" in cell_norm:
-                header_indexes["name"] = col_index
-            if "หนวย" in cell_norm or "หนวยนับ" in cell_norm or "หน่วย" in cell_norm:
-                header_indexes["unit"] = col_index
-            if "จำนวนขาย" in cell_norm or "จำนวน" in cell_norm and "ขาย" in cell_norm:
-                header_indexes["qty"] = col_index
-            if "ขาย" in cell_norm and "จำนวน" in cell_norm and "รับคืน" in cell_norm:
-                header_indexes["qty"] = col_index
+    header_row_index = None
+
+    for index, row in enumerate(rows[:40]):
+        normalized_row = [normalize_pos_header_text(value) for value in row]
+        row_has_code = any(("รหัสสินค้า" in cell or ("รหัส" in cell and "สินค้า" in cell)) for cell in normalized_row if cell)
+        row_has_name = any(("ชื่อสินค้า" in cell or ("ชื่อ" in cell and "สินค้า" in cell)) for cell in normalized_row if cell)
+        row_has_qty = any(("ขาย" in cell or "จำนวนขาย" in cell or ("จำนวน" in cell and "ขาย" in cell)) for cell in normalized_row if cell)
+
+        if row_has_code and row_has_name and row_has_qty:
+            header_row_index = index
+            for col_index, cell in enumerate(normalized_row):
+                if not cell:
+                    continue
+                if "รหัสสินค้า" in cell or ("รหัส" in cell and "สินค้า" in cell):
+                    header_indexes["code"] = col_index
+                if "ชื่อสินค้า" in cell or ("ชื่อ" in cell and "สินค้า" in cell):
+                    header_indexes["name"] = col_index
+                if "หน่วย" in cell or "หนวย" in cell or "หน่วยนับ" in cell:
+                    header_indexes["unit"] = col_index
+                if "จำนวนขาย" in cell or ("จำนวน" in cell and "ขาย" in cell):
+                    header_indexes["qty"] = col_index
+                if "ขาย" in cell and "qty" not in header_indexes:
+                    header_indexes["qty"] = col_index
+            break
+
     if not header_indexes:
         raise ValueError("ไม่พบหัวเรื่องที่จำเป็นในไฟล์ POS")
     if "code" not in header_indexes or "name" not in header_indexes or "qty" not in header_indexes:
         raise ValueError("ไฟล์ POS ไม่มีคอลัมน์ที่จำเป็น: รหัสสินค้า / ชื่อสินค้า / จำนวนขาย")
 
     data_rows = []
-    start = 0
-    for index, row in enumerate(rows):
-        if index < 20 and any(re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(value).strip()).casefold() for value in row if str(value).strip()):
-            if {
-                re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(cell).strip()).casefold()
-                for cell in row if str(cell).strip()
-            }:
-                pass
-        if index >= 1:
-            row_values = row
-            if len(row_values) <= max(header_indexes.values()):
-                continue
-            if any(str(cell).strip() for cell in row_values):
-                data_rows.append(row_values)
+    start_index = (header_row_index + 1) if header_row_index is not None else 0
+    for row in rows[start_index:]:
+        if len(row) <= max(header_indexes.values()):
+            continue
+        if not any(str(cell).strip() for cell in row):
+            continue
+        if all(normalize_pos_header_text(cell) in {"", "รหัสสินค้า", "ชื่อสินค้า", "หน่วย", "หนวย", "หน่วยนับ", "จำนวน", "ขาย"} for cell in row[:max(header_indexes.values()) + 1]):
+            continue
+        data_rows.append(row)
     return header_indexes, data_rows
 
 
@@ -1399,10 +1409,15 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError("รูปแบบไฟล์ POS ไม่ถูกต้อง") from exc
                 if len(file_bytes) > 20 * 1024 * 1024:
                     raise ValueError("ไฟล์ POS มีขนาดเกิน 20 MB")
-                if not file_name.lower().endswith((".xlsx", ".xls")):
-                    raise ValueError("รองรับเฉพาะไฟล์ Excel .xlsx หรือ .xls")
                 if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
-                    raise ValueError("ไฟล์ POS ต้องเป็น Excel XLSX/ZIP ที่ถูกต้อง")
+                    raise ValueError("ไฟล์ POS ไม่ใช่ Excel XLSX/ZIP ที่ถูกต้อง")
+                try:
+                    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                        names = set(archive.namelist())
+                        if not ("xl/workbook.xml" in names or "xl\workbook.xml" in names):
+                            raise ValueError("ไฟล์ POS ไม่ใช่ Excel XLSX/ZIP ที่ถูกต้อง")
+                except zipfile.BadZipFile as exc:
+                    raise ValueError("ไฟล์ POS ไม่ใช่ Excel XLSX/ZIP ที่ถูกต้อง") from exc
 
                 import_result = parse_pos_sales_from_bytes(file_name, file_bytes, branch, user["username"])
                 with db() as conn:

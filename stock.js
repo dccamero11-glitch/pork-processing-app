@@ -391,13 +391,6 @@
             return;
         }
 
-        const filename = file.name.toLowerCase();
-        if (!filename.endsWith(".xlsx") && !filename.endsWith(".xls")) {
-            showImportMessage("ไฟล์ที่เลือกต้องเป็น Excel (.xlsx หรือ .xls)");
-            event.target.value = "";
-            return;
-        }
-
         if (file.size > 20 * 1024 * 1024) {
             showImportMessage("ไฟล์ POS มีขนาดเกิน 20 MB");
             event.target.value = "";
