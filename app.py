@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 import io
 import logging
+import re
 import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -20,6 +21,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
@@ -203,6 +205,19 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_counts_date_branch ON stock_counts(stock_date,branch)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_counts_product ON stock_counts(product_code)")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS stock_pos_sales(
+            id {id_column},
+            sale_date TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            product_code TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            sold_quantity NUMERIC NOT NULL DEFAULT 0,
+            source_filename TEXT NOT NULL DEFAULT '',
+            imported_by TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            UNIQUE(sale_date,branch,product_code)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_pos_sales_date_branch ON stock_pos_sales(sale_date,branch)")
 
         conn.execute(f"""CREATE TABLE IF NOT EXISTS selling_prices(
             id {id_column}, product_category TEXT NOT NULL, product_name TEXT NOT NULL,
@@ -497,6 +512,237 @@ def make_xlsx(title, metadata, rows):
     return output.getvalue()
 
 
+def normalize_stock_name(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip()).casefold()
+
+
+def load_stock_catalog_lookup():
+    catalog_path = ROOT / "stock_catalog.json"
+    if not catalog_path.exists():
+        return {"by_code": {}, "by_name": {}}
+    try:
+        data = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"by_code": {}, "by_name": {}}
+
+    by_code = {}
+    by_name = {}
+    for product in (data.get("products") or []):
+        code = str(product.get("code", "")).strip()
+        name = str(product.get("name", "")).strip()
+        if code:
+            by_code[code] = product
+        if name:
+            by_name[normalize_stock_name(name)] = product
+    return {"by_code": by_code, "by_name": by_name}
+
+
+def parse_excel_cell(cell, shared_strings):
+    if cell is None:
+        return ""
+    cell_type = cell.get("t")
+    if cell_type == "inlineStr":
+        text_node = cell.find("{*}is/{*}t")
+        if text_node is not None:
+            return text_node.text or ""
+        return ""
+    if cell_type == "s":
+        value = cell.findtext("{*}v")
+        if value is None:
+            return ""
+        try:
+            idx = int(float(value))
+        except ValueError:
+            return ""
+        return shared_strings[idx] if idx < len(shared_strings) else ""
+    if cell_type == "b":
+        return "TRUE" if cell.findtext("{*}v") == "1" else "FALSE"
+    value = cell.findtext("{*}v")
+    return value or ""
+
+
+def parse_pos_report_date(value):
+    if not value:
+        return ""
+    match = re.search(r"(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})", str(value).strip())
+    if not match:
+        return ""
+    day, month, year_text = match.groups()
+    try:
+        year = int(year_text)
+        if year >= 2400:
+            year -= 543
+        return datetime(year, int(month), int(day)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def parse_pos_xlsx_rows(file_bytes):
+    if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
+        raise ValueError("ไฟล์ POS ต้องเป็นไฟล์ XLSX/ZIP ที่ถูกต้อง")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+            names = archive.namelist()
+            shared_strings = []
+            if "xl/sharedStrings.xml" in names:
+                try:
+                    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                except ET.ParseError as exc:
+                    raise ValueError("อ่าน sharedStrings ของไฟล์ POS ไม่สำเร็จ") from exc
+                for si in root.findall("{*}si"):
+                    text = "".join(node.text or "" for node in si.iterfind("{*}t") if node.text)
+                    shared_strings.append(text)
+
+            workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+            rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            rel_map = {}
+            for rel in rels_root.findall("{*}Relationship"):
+                rel_map[rel.get("Id")] = rel.get("Target")
+
+            sheet_paths = []
+            for sheet in workbook_root.findall("{*}sheets/{*}sheet"):
+                sheet_name = sheet.get("name", "")
+                rel_id = sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                target = rel_map.get(rel_id)
+                if target:
+                    sheet_paths.append((sheet_name, target))
+
+            if not sheet_paths:
+                raise ValueError("ไม่พบ Worksheet ในไฟล์ POS")
+
+            rows = []
+            for _, target in sheet_paths:
+                path = target if target.startswith("/") else f"xl/{target.lstrip('/')}"
+                if path not in names:
+                    continue
+                try:
+                    sheet_root = ET.fromstring(archive.read(path))
+                except ET.ParseError:
+                    continue
+                for row in sheet_root.findall(".//{*}sheetData/{*}row"):
+                    row_values = []
+                    for cell in row.findall("{*}c"):
+                        row_values.append(parse_excel_cell(cell, shared_strings))
+                    if row_values:
+                        rows.append(row_values)
+
+            if not rows:
+                raise ValueError("ไม่พบข้อมูลรายงานในไฟล์ POS")
+
+            return rows
+    except zipfile.BadZipFile as exc:
+        raise ValueError("ไฟล์ POS ไม่ใช่ ZIP/XLSX ที่ถูกต้อง") from exc
+
+
+def find_pos_report_rows(rows):
+    header_indexes = {}
+    for index, row in enumerate(rows[:20]):
+        normalized_row = [re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(value).strip()) for value in row]
+        for col_index, cell in enumerate(normalized_row):
+            cell_norm = cell.casefold()
+            if "รหัสสินค้า" in cell_norm or "รหัส" in cell_norm and "สินค้า" in cell_norm:
+                header_indexes["code"] = col_index
+            if "ชื่อสินค้า" in cell_norm or "ชื่อ" in cell_norm and "สินค้า" in cell_norm:
+                header_indexes["name"] = col_index
+            if "หนวย" in cell_norm or "หนวยนับ" in cell_norm or "หน่วย" in cell_norm:
+                header_indexes["unit"] = col_index
+            if "จำนวนขาย" in cell_norm or "จำนวน" in cell_norm and "ขาย" in cell_norm:
+                header_indexes["qty"] = col_index
+            if "ขาย" in cell_norm and "จำนวน" in cell_norm and "รับคืน" in cell_norm:
+                header_indexes["qty"] = col_index
+    if not header_indexes:
+        raise ValueError("ไม่พบหัวเรื่องที่จำเป็นในไฟล์ POS")
+    if "code" not in header_indexes or "name" not in header_indexes or "qty" not in header_indexes:
+        raise ValueError("ไฟล์ POS ไม่มีคอลัมน์ที่จำเป็น: รหัสสินค้า / ชื่อสินค้า / จำนวนขาย")
+
+    data_rows = []
+    start = 0
+    for index, row in enumerate(rows):
+        if index < 20 and any(re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(value).strip()).casefold() for value in row if str(value).strip()):
+            if {
+                re.sub(r"[^ก-๙a-zA-Z0-9]+", "", str(cell).strip()).casefold()
+                for cell in row if str(cell).strip()
+            }:
+                pass
+        if index >= 1:
+            row_values = row
+            if len(row_values) <= max(header_indexes.values()):
+                continue
+            if any(str(cell).strip() for cell in row_values):
+                data_rows.append(row_values)
+    return header_indexes, data_rows
+
+
+def parse_pos_sales_from_bytes(file_name, file_bytes, branch, imported_by):
+    rows = parse_pos_xlsx_rows(file_bytes)
+    header_indexes, data_rows = find_pos_report_rows(rows)
+    report_date = ""
+    for row in rows:
+        for value in row:
+            parsed = parse_pos_report_date(value)
+            if parsed:
+                report_date = parsed
+                break
+        if report_date:
+            break
+    if not report_date:
+        raise ValueError("ไม่พบวันที่รายงานในไฟล์ POS")
+
+    catalog = load_stock_catalog_lookup()
+    matched_rows = []
+    unmatched = []
+    for row in data_rows:
+        if len(row) <= max(header_indexes.values()):
+            continue
+        code_raw = (row[header_indexes.get("code", 0)] if "code" in header_indexes else "").strip()
+        name_raw = (row[header_indexes.get("name", 0)] if "name" in header_indexes else "").strip()
+        unit_raw = (row[header_indexes.get("unit", 0)] if "unit" in header_indexes else "").strip()
+        qty_raw = (row[header_indexes.get("qty", 0)] if "qty" in header_indexes else "").strip()
+        code = str(code_raw).strip()
+        name = str(name_raw).strip()
+        if not name and not code:
+            continue
+        try:
+            sold_quantity = Decimal(str(qty_raw or "0").replace(",", ""))
+        except (InvalidOperation, ValueError):
+            continue
+        if sold_quantity <= 0:
+            continue
+
+        product = None
+        if code and code in catalog["by_code"]:
+            product = catalog["by_code"][code]
+        elif name:
+            product = catalog["by_name"].get(normalize_stock_name(name))
+        if not product:
+            unmatched.append(name or code)
+            continue
+
+        matched_rows.append({
+            "sale_date": report_date,
+            "branch": branch,
+            "product_code": str(product.get("code", code)).strip(),
+            "product_name": str(product.get("name", name)).strip(),
+            "sold_quantity": float(sold_quantity),
+            "source_filename": file_name,
+            "imported_by": imported_by,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    unique_rows = {}
+    for row in matched_rows:
+        key = (row["sale_date"], row["branch"], row["product_code"])
+        unique_rows[key] = row
+    return {
+        "report_date": report_date,
+        "rows": list(unique_rows.values()),
+        "unmatched": unmatched,
+    }
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -644,6 +890,13 @@ class Handler(SimpleHTTPRequestHandler):
                     (branch, stock_date, branch)
                 ).fetchall()
 
+                pos_rows = conn.execute(
+                    """SELECT product_code, sold_quantity
+                    FROM stock_pos_sales
+                    WHERE sale_date=? AND branch=?""",
+                    (stock_date, branch)
+                ).fetchall()
+
             received = {
                 row["product_name"]: float(row["received"] or 0)
                 for row in receipt_rows
@@ -665,12 +918,19 @@ class Handler(SimpleHTTPRequestHandler):
                 for row in opening_rows
             }
 
+            pos_sales_by_product_code = {
+                str(row["product_code"]): float(row["sold_quantity"] or 0)
+                for row in pos_rows
+            }
+
             self.send_json({
                 "date": stock_date,
                 "branch": branch,
                 "received_by_product_name": received,
                 "opening_by_product_code": opening_by_product_code,
-                "counts": counts
+                "counts": counts,
+                "pos_sales_by_product_code": pos_sales_by_product_code,
+                "pos_sales_by_product_name": {str(code): float(value) for code, value in pos_sales_by_product_code.items()}
             })
             return
 
@@ -1122,6 +1382,60 @@ class Handler(SimpleHTTPRequestHandler):
                     "actual_quantity": float(actual),
                     "system_quantity": float(system),
                     "variance": float(variance)
+                })
+                return
+
+            if self.path == "/api/stock/pos-import":
+                branch = effective_branch(user, str(data.get("branch") or user.get("branch") or ""))
+                file_name = str(data.get("file_name", "")).strip()
+                file_b64 = str(data.get("file_base64", "")).strip()
+                if not file_name:
+                    raise ValueError("กรุณาเลือกไฟล์ POS")
+                if not file_b64:
+                    raise ValueError("ไฟล์ POS ว่างเปล่า")
+                try:
+                    file_bytes = base64.b64decode(file_b64, validate=True)
+                except Exception as exc:
+                    raise ValueError("รูปแบบไฟล์ POS ไม่ถูกต้อง") from exc
+                if len(file_bytes) > 20 * 1024 * 1024:
+                    raise ValueError("ไฟล์ POS มีขนาดเกิน 20 MB")
+                if not file_name.lower().endswith((".xlsx", ".xls")):
+                    raise ValueError("รองรับเฉพาะไฟล์ Excel .xlsx หรือ .xls")
+                if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
+                    raise ValueError("ไฟล์ POS ต้องเป็น Excel XLSX/ZIP ที่ถูกต้อง")
+
+                import_result = parse_pos_sales_from_bytes(file_name, file_bytes, branch, user["username"])
+                with db() as conn:
+                    for row in import_result["rows"]:
+                        conn.execute(
+                            """INSERT INTO stock_pos_sales(
+                                sale_date, branch, product_code, product_name,
+                                sold_quantity, source_filename, imported_by, created_at
+                            ) VALUES(?,?,?,?,?,?,?,?)
+                            ON CONFLICT(sale_date, branch, product_code)
+                            DO UPDATE SET
+                                product_name=excluded.product_name,
+                                sold_quantity=excluded.sold_quantity,
+                                source_filename=excluded.source_filename,
+                                imported_by=excluded.imported_by,
+                                created_at=excluded.created_at""",
+                            (
+                                row["sale_date"],
+                                row["branch"],
+                                row["product_code"],
+                                row["product_name"],
+                                float(row["sold_quantity"]),
+                                row["source_filename"],
+                                row["imported_by"],
+                                row["created_at"],
+                            ),
+                        )
+                self.send_json({
+                    "ok": True,
+                    "report_date": import_result["report_date"],
+                    "imported_count": len(import_result["rows"]),
+                    "unmatched_count": len(import_result["unmatched"]),
+                    "unmatched_names": import_result["unmatched"],
                 })
                 return
 

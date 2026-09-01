@@ -377,23 +377,89 @@
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
 
+    function showImportMessage(message) {
+        alert(message);
+    }
+
     $("importBtn").addEventListener("click", () => {
         $("posFile").click();
     });
 
-    $("posFile").addEventListener("change", event => {
+    $("posFile").addEventListener("change", async event => {
         const file = event.target.files?.[0];
-
         if (!file) {
             return;
         }
 
-        alert(
-            "เลือกไฟล์ " + file.name +
-            " แล้ว\n\nขั้นนี้หน้า Stock พร้อมแล้ว แต่การอ่านยอดจากไฟล์ POS จะเชื่อมกับ Backend ในขั้นถัดไป"
-        );
+        const filename = file.name.toLowerCase();
+        if (!filename.endsWith(".xlsx") && !filename.endsWith(".xls")) {
+            showImportMessage("ไฟล์ที่เลือกต้องเป็น Excel (.xlsx หรือ .xls)");
+            event.target.value = "";
+            return;
+        }
 
-        event.target.value = "";
+        if (file.size > 20 * 1024 * 1024) {
+            showImportMessage("ไฟล์ POS มีขนาดเกิน 20 MB");
+            event.target.value = "";
+            return;
+        }
+
+        const importBtn = $("importBtn");
+        importBtn.disabled = true;
+        importBtn.textContent = "กำลังนำเข้า...";
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const bytes = new Uint8Array(buffer);
+            let binary = "";
+            for (let i = 0; i < bytes.length; i += 1) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            const base64 = btoa(binary);
+
+            const response = await fetch("/api/stock/pos-import", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    branch: branchFilter.value,
+                    file_name: file.name,
+                    file_base64: base64
+                })
+            });
+
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.message || "นำเข้าไฟล์ POS ไม่สำเร็จ");
+            }
+
+            if (result.report_date) {
+                stockDate.value = result.report_date;
+            }
+
+            await loadStockBackend();
+            render();
+
+            const unmatchedList = (result.unmatched_names || []).slice(0, 10).join("\n");
+            const summary = [
+                "นำเข้า POS สำเร็จ",
+                `วันที่: ${result.report_date || stockDate.value}`,
+                `นำเข้าสำเร็จ: ${result.imported_count || 0} รายการ`,
+                `ไม่พบสินค้า: ${result.unmatched_count || 0} รายการ`,
+            ];
+            if (result.unmatched_names && result.unmatched_names.length) {
+                summary.push("รายการที่ไม่พบสินค้า:\n" + unmatchedList);
+            }
+            showImportMessage(summary.join("\n"));
+        } catch (error) {
+            console.error(error);
+            showImportMessage(error.message || "เกิดข้อผิดพลาดขณะนำเข้าไฟล์ POS");
+        } finally {
+            importBtn.disabled = false;
+            importBtn.textContent = "นำเข้าไฟล์ POS";
+            event.target.value = "";
+        }
     });
 
     function todayIso() {
@@ -405,49 +471,7 @@
     }
 
     async function loadPosStockData() {
-        const response = await fetch(
-            "/stock_pos_import.json?ts=" + Date.now(),
-            { cache: "no-store" }
-        );
-
-        if (!response.ok) {
-            throw new Error("ไม่พบข้อมูลนำเข้าจาก POS");
-        }
-
-        const data = await response.json();
-
-        const byCode = new Map();
-
-        (data.products || []).forEach(item => {
-            byCode.set(String(item.code), item);
-        });
-
-        state.products.forEach(product => {
-            const pos = byCode.get(String(product.code));
-
-            if (!pos) {
-                return;
-            }
-
-            product.opening =
-                Number(pos.opening || 0);
-
-            product.processed =
-                Number(pos.processed || 0);
-
-            product.sold =
-                (stockDate.value || todayIso()) === String(data.report_date || "")
-                    ? Number(pos.sold || 0)
-                    : 0;
-
-            product.posReceived =
-                Number(pos.pos_received || 0);
-
-            product.posClosing =
-                Number(pos.pos_closing || 0);
-        });
-
-        state.posImport = data;
+        return null;
     }
 
     const RECEIVING_NAME_ALIASES = {
@@ -486,23 +510,20 @@
             data.received_by_product_name || {};
 
         const opening =
-
             data.opening_by_product_code || {};
-
 
         const counts =
             data.counts || {};
 
+        const posSales =
+            data.pos_sales_by_product_code || {};
+
         state.products.forEach(product => {
-
-            product.opening =
-                Number(opening[product.code] || 0);
-
-            product.received =
-                Number(received[receivingNameForStock(product.name)] || 0);
+            product.opening = Number(opening[product.code] || 0);
+            product.received = Number(received[receivingNameForStock(product.name)] || 0);
+            product.sold = Number(posSales[product.code] || 0);
 
             const saved = counts[product.code];
-
             if (saved) {
                 state.actual[getActualKey(product.code)] = String(saved.actual);
             }
@@ -576,12 +597,6 @@
             }));
 
             renderCategories();
-
-            try {
-                await loadPosStockData();
-            } catch (posError) {
-                console.error(posError);
-            }
 
             try {
                 await loadStockBackend();
