@@ -585,39 +585,48 @@ def parse_pos_xlsx_rows(file_bytes):
 
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
-            names = archive.namelist()
+            names = set(archive.namelist())
+            if "xl/workbook.xml" not in names:
+                raise ValueError("ไฟล์ POS ไม่ใช่ Excel XLSX/ZIP ที่ถูกต้อง")
+
             shared_strings = []
-            if "xl/sharedStrings.xml" in names:
+            shared_strings_path = "xl/sharedStrings.xml"
+            if shared_strings_path in names:
                 try:
-                    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                    root = ET.fromstring(archive.read(shared_strings_path))
                 except ET.ParseError as exc:
                     raise ValueError("อ่าน sharedStrings ของไฟล์ POS ไม่สำเร็จ") from exc
                 for si in root.findall("{*}si"):
                     text = "".join(node.text or "" for node in si.iterfind("{*}t") if node.text)
                     shared_strings.append(text)
 
-            workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
-            rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            workbook_path = "xl/workbook.xml"
+            workbook_root = ET.fromstring(archive.read(workbook_path))
+            rels_path = "xl/_rels/workbook.xml.rels"
             rel_map = {}
-            for rel in rels_root.findall("{*}Relationship"):
-                rel_map[rel.get("Id")] = rel.get("Target")
+            if rels_path in names:
+                rels_root = ET.fromstring(archive.read(rels_path))
+                for rel in rels_root.findall("{*}Relationship"):
+                    rel_map[rel.get("Id")] = rel.get("Target")
 
             sheet_paths = []
             for sheet in workbook_root.findall("{*}sheets/{*}sheet"):
-                sheet_name = sheet.get("name", "")
                 rel_id = sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
                 target = rel_map.get(rel_id)
-                if target:
-                    sheet_paths.append((sheet_name, target))
+                if not target:
+                    continue
+                target_path = target if target.startswith("/") else f"xl/{target.lstrip('/')}"
+                if target_path not in names:
+                    target_path = target if target.startswith("/") else target.lstrip('/')
+                    if target_path not in names:
+                        continue
+                sheet_paths.append(target_path)
 
             if not sheet_paths:
                 raise ValueError("ไม่พบ Worksheet ในไฟล์ POS")
 
             rows = []
-            for _, target in sheet_paths:
-                path = target if target.startswith("/") else f"xl/{target.lstrip('/')}"
-                if path not in names:
-                    continue
+            for path in sheet_paths:
                 try:
                     sheet_root = ET.fromstring(archive.read(path))
                 except ET.ParseError:
@@ -1414,7 +1423,7 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
                         names = set(archive.namelist())
-                        if not ("xl/workbook.xml" in names or "xl\workbook.xml" in names):
+                        if "xl/workbook.xml" not in names:
                             raise ValueError("ไฟล์ POS ไม่ใช่ Excel XLSX/ZIP ที่ถูกต้อง")
                 except zipfile.BadZipFile as exc:
                     raise ValueError("ไฟล์ POS ไม่ใช่ Excel XLSX/ZIP ที่ถูกต้อง") from exc
