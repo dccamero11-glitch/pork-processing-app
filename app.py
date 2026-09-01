@@ -23,6 +23,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "processing.db"
@@ -36,6 +37,17 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime
 logger = logging.getLogger("pork-processing-app")
 BRANCH_ORDER = ("บางบัวทอง", "หลังสวน", "ตรัง")
 BRANCHES = set(BRANCH_ORDER)
+THAILAND_TZ = ZoneInfo("Asia/Bangkok")
+
+
+def thailand_now():
+    return datetime.now(THAILAND_TZ)
+
+
+def thailand_today_iso():
+    return thailand_now().date().isoformat()
+
+
 CATEGORIES = {
     "หมูบด A", "หมูบด B", "หมูบด 5", "หมูบดผสมไก่", "หมูอ้วนหมูบด(หมูบด6)",
     "ขาหน้าล้วน", "ขาหลังล้วน", "ขาหลังเลาะ", "คากิ", "คาตั้งกลม", "เครื่องในต้ม",
@@ -1047,7 +1059,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         if clean_path == "/api/orders/summary":
             from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query); order_date = q.get("date", [date.today().isoformat()])[0]
+            q = parse_qs(urlparse(self.path).query); order_date = q.get("date", [thailand_today_iso()])[0]
             requested = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
             try: datetime.strptime(order_date, "%Y-%m-%d")
             except ValueError: self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
@@ -1600,7 +1612,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if len(note) > 2000:
                     raise ValueError("หมายเหตุยาวเกินไป")
                 total_weight = sum((item[1] for item in order_items), Decimal("0"))
-                now = datetime.now().isoformat(timespec="seconds")
+                now = thailand_now().isoformat(timespec="seconds")
                 stored_total = total_weight if USE_POSTGRES else float(total_weight)
                 order_stage = "open_transaction"
                 with db() as conn:
@@ -1616,7 +1628,7 @@ class Handler(SimpleHTTPRequestHandler):
                         order_id = conn.execute(
                             """INSERT INTO orders(order_date,branch,ordered_by,total_weight,note,created_at)
                             VALUES(?,?,?,?,?,?) RETURNING id""",
-                            (date.today().isoformat(), branch, user["username"], stored_total, note, now),
+                            (thailand_today_iso(), branch, user["username"], stored_total, note, now),
                         ).fetchone()["id"]
                         order_stage = "insert_items"
                         conn.executemany(
