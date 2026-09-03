@@ -1059,7 +1059,8 @@ class Handler(SimpleHTTPRequestHandler):
 
         if clean_path == "/api/orders/summary":
             from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query); order_date = q.get("date", [thailand_today_iso()])[0]
+            q = parse_qs(urlparse(self.path).query)
+            order_date = q.get("order_date", q.get("date", [thailand_today_iso()]))[0]
             requested = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
             try: datetime.strptime(order_date, "%Y-%m-%d")
             except ValueError: self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
@@ -1068,15 +1069,20 @@ class Handler(SimpleHTTPRequestHandler):
             sql = """SELECT i.product_name,o.branch,SUM(i.quantity) quantity FROM orders o JOIN order_items i ON i.order_id=o.id WHERE o.order_date=?"""; params=[order_date]
             if selected != "ALL": sql += " AND o.branch=?"; params.append(selected)
             sql += " GROUP BY i.product_name,o.branch"
+            total_sql = "SELECT branch,SUM(total_weight) total_weight FROM orders WHERE order_date=?"; total_params=[order_date]
+            if selected != "ALL": total_sql += " AND branch=?"; total_params.append(selected)
+            total_sql += " GROUP BY branch"
             note_sql = "SELECT branch,note,created_at FROM orders WHERE order_date=? AND TRIM(note)<>''"; note_params=[order_date]
             if selected != "ALL": note_sql += " AND branch=?"; note_params.append(selected)
             note_sql += " ORDER BY branch,created_at"
             with db() as conn:
-                aggregates=[dict(row) for row in conn.execute(sql,params)]; note_rows=[dict(row) for row in conn.execute(note_sql,note_params)]
+                aggregates=[dict(row) for row in conn.execute(sql,params)]; total_rows=[dict(row) for row in conn.execute(total_sql,total_params)]; note_rows=[dict(row) for row in conn.execute(note_sql,note_params)]
             visible_branches = list(BRANCH_ORDER) if selected == "ALL" else [selected]
-            branch_totals={branch:0.0 for branch in visible_branches}; product_map={name:{branch:0.0 for branch in visible_branches} for name in ORDER_PRODUCTS}
+            branch_totals={branch:0.0 for branch in visible_branches}
+            for row in total_rows: branch_totals[row["branch"]]=float(row["total_weight"] or 0)
+            product_map={name:{branch:0.0 for branch in visible_branches} for name in ORDER_PRODUCTS}
             for row in aggregates:
-                quantity=float(row["quantity"]); product_map.setdefault(row["product_name"],{branch:0.0 for branch in visible_branches})[row["branch"]]=quantity; branch_totals[row["branch"]]+=quantity
+                quantity=float(row["quantity"]); product_map.setdefault(row["product_name"],{branch:0.0 for branch in visible_branches})[row["branch"]]=quantity
             products=[]
             for name, values in product_map.items(): products.append({"product_name":name,**values,"total":sum(values.values())})
             notes={branch:[] for branch in visible_branches}
@@ -1111,7 +1117,7 @@ class Handler(SimpleHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
             branch = q.get("branch", ["ALL" if user["role"] == "admin" else user.get("branch", "")])[0]
-            order_date = q.get("date", [""])[0]
+            order_date = q.get("order_date", q.get("date", [""]))[0]
             try: branch = effective_branch(user, branch, allow_all=True)
             except PermissionError as exc: self.send_json({"message": str(exc)}, 403); return
             if order_date:
