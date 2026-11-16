@@ -74,6 +74,14 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(saved['order_id'], again['order_id'])
         _, old = self.request('/api/orders/' + str(saved['order_id']))
         self.assertEqual(old['billing']['total_amount'], 318.75)
+        _, history = self.request('/api/orders?invoice=PO-001')
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['invoice_number'], 'PO-001')
+        self.assertEqual(history[0]['total_amount'], 318.75)
+        self.assertEqual(self.request('/api/orders?invoice=NO-MATCH')[1], [])
+        with patch.object(app.Handler, 'current_user', return_value={'username': 'm', 'role': 'manager', 'branch': 'ตรัง'}):
+            self.assertEqual(self.request('/api/orders?branch=' + urllib.parse.quote('ตรัง'))[1], [])
+            self.assertEqual(self.request('/api/orders/' + str(saved['order_id']))[0], 403)
         payload['request_id'] = 'stale-price-test'
         self.assertEqual(self.request('/api/orders', payload)[0], 400)
         with app.db() as conn:

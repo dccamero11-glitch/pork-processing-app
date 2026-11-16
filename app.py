@@ -1132,16 +1132,23 @@ class Handler(SimpleHTTPRequestHandler):
                 try: datetime.strptime(order_date, "%Y-%m-%d")
                 except ValueError: self.send_json({"message": "รูปแบบวันที่ไม่ถูกต้อง"}, 400); return
             sql = """SELECT o.id,o.order_date,o.branch,o.ordered_by,o.total_weight,o.note,o.created_at,
+                (SELECT b.invoice_number FROM order_billing b WHERE b.order_id=o.id) invoice_number,
+                (SELECT b.total_amount FROM order_billing b WHERE b.order_id=o.id) total_amount,
                 COUNT(i.id) item_count FROM orders o LEFT JOIN order_items i ON i.order_id=o.id WHERE 1=1"""
             params = []
             if branch != "ALL": sql += " AND o.branch=?"; params.append(branch)
             if order_date: sql += " AND o.order_date=?"; params.append(order_date)
+            invoice = q.get("invoice", [""])[0].strip()
+            if invoice:
+                sql += " AND EXISTS (SELECT 1 FROM order_billing b WHERE b.order_id=o.id AND LOWER(b.invoice_number) LIKE LOWER(?))"
+                params.append("%" + invoice + "%")
             sql += " GROUP BY o.id,o.order_date,o.branch,o.ordered_by,o.total_weight,o.note,o.created_at ORDER BY o.order_date DESC,o.id DESC"
             with db() as conn: rows = [dict(row) for row in conn.execute(sql, params)]
             for row in rows:
                 row["order_date"] = str(row["order_date"])
                 row["created_at"] = str(row["created_at"])
                 row["total_weight"] = float(row["total_weight"])
+                row["total_amount"] = float(row["total_amount"]) if row["total_amount"] is not None else None
             self.send_json(rows); return
         if clean_path in ("/api/selling-prices", "/api/selling-price-history"):
             from urllib.parse import urlparse, parse_qs

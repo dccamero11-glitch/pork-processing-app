@@ -92,3 +92,5 @@ window.authReady=fetch("/api/me").then(async response=>{if(response.status===401
 
 // Shared ordering price navigation.
 window.authReady.then(()=>{document.querySelectorAll('nav').forEach(nav=>{if(nav.querySelector('a[href="/order-prices.html"]'))return;const a=document.createElement('a');a.href='/order-prices.html';a.className='nav-link';a.textContent='ราคาสินค้าหมูไก่';nav.append(a)})});
+
+window.authReady.then(()=>{document.querySelectorAll('a[href="/order-history.html"]').forEach(a=>a.textContent='ประวัติการสั่งซื้อ/วางบิล')});
