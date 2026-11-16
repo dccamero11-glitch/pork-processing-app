@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import order_pricing
 import base64
 import hashlib
 import hmac
@@ -156,6 +157,7 @@ def init_db():
             role TEXT NOT NULL, branch TEXT, active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )""")
+        order_pricing.initialize(conn)
         conn.execute(f"""CREATE TABLE IF NOT EXISTS orders(
             id {id_column}, order_date DATE NOT NULL, branch TEXT NOT NULL,
             ordered_by TEXT NOT NULL, total_weight NUMERIC NOT NULL,
@@ -460,13 +462,13 @@ def prepare_order_items(data):
     rows = []
     for item in data.get("items", []):
         product_name = str(item.get("product_name", "")).strip()
-        if product_name not in ORDER_PRODUCTS:
+        if product_name not in set(ORDER_PRODUCTS) | set(SELLING_PRODUCTS["ไก่"]):
             raise ValueError("พบชื่อสินค้าที่ไม่ถูกต้อง")
         try:
             quantity = Decimal(str(item.get("quantity", 0) or 0))
         except (InvalidOperation, ValueError):
             raise ValueError("จำนวน/น้ำหนักต้องเป็นตัวเลข")
-        if not quantity.is_finite() or quantity < 0:
+        if not quantity.is_finite() or quantity < 0 or quantity > 1000000:
             raise ValueError("จำนวน/น้ำหนักต้องไม่ติดลบ")
         unit = str(item.get("unit", "กก.")).strip()
         if unit != "กก.":
@@ -855,6 +857,10 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 ]
             self.send_json(rows); return
+        if clean_path == "/api/order-prices":
+            with db() as conn:
+                rows = order_pricing.prices(conn)
+            self.send_json({"items": rows, "version": order_pricing.version(rows)}); return
         if clean_path == "/api/product-catalog":
             self.send_json({"pork": list(ORDER_PRODUCTS), "chicken": list(SELLING_PRODUCTS.get("ไก่", ())) }); return
         if clean_path == "/api/stock":
@@ -1112,6 +1118,8 @@ class Handler(SimpleHTTPRequestHandler):
             result["total_weight"] = float(result["total_weight"])
             for item in items: item["quantity"] = float(item["quantity"])
             result["items"] = items
+            with db() as conn:
+                result["billing"] = order_pricing.billing(conn, order_id)
             self.send_json(result); return
         if clean_path == "/api/orders":
             from urllib.parse import urlparse, parse_qs
@@ -1296,6 +1304,13 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"message": "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว"}); return
             user = self.require_user()
             if not user: return
+            if self.path == "/api/order-prices":
+                now = thailand_now().isoformat(timespec="microseconds")
+                with db() as conn:
+                    if USE_POSTGRES:
+                        conn.execute("LOCK TABLE order_catalog_prices IN SHARE ROW EXCLUSIVE MODE")
+                    order_pricing.save_prices(conn, data, user, set(ORDER_PRODUCTS) | set(SELLING_PRODUCTS["ไก่"]), now)
+                self.send_json({"success": True}); return
             if self.path == "/api/read-label":
                 image = str(data.get("image", ""))
                 if not image.startswith("data:image/"):
@@ -1643,6 +1658,10 @@ class Handler(SimpleHTTPRequestHandler):
                             [(order_id, product_name, quantity if USE_POSTGRES else float(quantity), unit, now)
                              for product_name, quantity, unit in order_items],
                         )
+                        order_stage = "save_billing"
+                        if USE_POSTGRES:
+                            conn.execute("LOCK TABLE order_catalog_prices IN SHARE MODE")
+                        order_pricing.save_billing(conn, order_id, data, order_items, now)
                         order_stage = "save_idempotency"
                         conn.execute("INSERT INTO order_requests(request_id,order_id,created_at) VALUES(?,?,?)", (request_id, order_id, now))
                         response_total = float(total_weight)

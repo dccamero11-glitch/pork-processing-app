@@ -15,6 +15,14 @@ from unittest import mock
 import app
 
 
+def add_billing_fixture(payload):
+    payload["billing"] = {"invoice_number": "TEST-001", "branch_name": payload["branch"], "address": "ที่อยู่ทดสอบ"}
+    payload["quoted_prices"] = {row["product_name"]: 100 for row in payload["items"]}
+    with app.db() as conn:
+        for name in payload["quoted_prices"]:
+            conn.execute("INSERT INTO order_catalog_prices(product_name,unit_price,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(product_name) DO NOTHING", (name, 100, "test", "2026-11-16"))
+
+
 def response_payload(product_name="เนื้อแดง (ไหล่)", net_weight_kg=0.090):
     text = json.dumps({"product_name": product_name, "net_weight_kg": net_weight_kg}, ensure_ascii=False)
     return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
@@ -402,6 +410,7 @@ class LabelReadingTests(unittest.TestCase):
                             {"product_name": "คากิ", "quantity": 0, "unit": "กก."},
                         ],
                     }
+                    add_billing_fixture(payload)
                     request = urllib.request.Request(
                         base_url + "/api/orders",
                         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -509,7 +518,7 @@ class LabelReadingTests(unittest.TestCase):
     def test_full_chicken_selling_products_are_unique_and_calculable(self):
         chicken = app.SELLING_PRODUCTS["ไก่"]
         required = ("ไก่เนื้อล้วง(ตัว)","ไก่กลม(ตัว)","น่อง+สะโพกไก่","เศษไก่ BL","เศษหนังBL","เศษไก่ BLK","ขายำ(เล็บมือนาง)","กระดูกอ่อนไก่","เครื่องในผ่ารวม","ตับติดใจ","ไก่สับ")
-        self.assertEqual(len(chicken), 24)
+        self.assertEqual(len(chicken), 30)
         self.assertEqual(len(chicken), len(set(chicken)))
         for product in required:
             values = app.calculate_selling_price({"product_category":"ไก่","product_name":product,"purchase_cost":100,"transport_cost":5,"profit_percent":15})
@@ -563,7 +572,7 @@ class LabelReadingTests(unittest.TestCase):
         self.assertEqual(len(app.ORDER_PRODUCTS), len(set(app.ORDER_PRODUCTS)))
         for name in ("เนื้อแดง", "สะโพก", "สามชั้น", "สามชั้นบาง"):
             self.assertIn(name, app.SELLING_PRODUCTS["หมู"])
-        self.assertEqual(len(app.SELLING_PRODUCTS["ไก่"]), 24)
+        self.assertEqual(len(app.SELLING_PRODUCTS["ไก่"]), 30)
         self.assertNotIn("ไก่เนื้อล้วง(ตัว)", app.SELLING_PRODUCTS["หมู"])
         self.assertNotIn("เนื้อแดง", app.SELLING_PRODUCTS["ไก่"])
 
@@ -601,6 +610,7 @@ class LabelReadingTests(unittest.TestCase):
                 saved=[]
                 for index, branch in enumerate(("บางบัวทอง","หลังสวน","ตรัง"),1):
                     payload={"request_id":f"three-branch-{index}","branch":branch,"items":[{"product_name":"เนื้อแดง","quantity":100,"unit":"กก."}]}
+                    add_billing_fixture(payload)
                     request=urllib.request.Request(base+"/api/orders",data=json.dumps(payload,ensure_ascii=False).encode(),headers={"Content-Type":"application/json"})
                     with urllib.request.urlopen(request,timeout=3) as response:
                         self.assertEqual(response.headers.get_content_type(),"application/json"); saved.append(json.load(response))
